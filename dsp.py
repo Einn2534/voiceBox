@@ -66,6 +66,31 @@ def _apply_fade(x: np.ndarray, fs: int, attack_ms: float = 5.0, release_ms: floa
     return y
 
 
+def _apply_formant_filters(src: np.ndarray, formants: Sequence[float], bandwidths: Sequence[float], fs: int) -> np.ndarray:
+    """フォルマント設定に基づいて帯域通過を連結"""
+    y = np.zeros_like(src, dtype=DTYPE)
+    for fi, bwi in zip(formants, bandwidths):
+        Q = max(0.5, fi / float(bwi))
+        b0, b1, b2, a1, a2 = _bandpass_biquad_coeff(fi, Q, fs)
+        y += _biquad_process(src, b0, b1, b2, a1, a2)
+    return _lip_radiation(y)
+
+
+def _add_breath_noise(signal: np.ndarray, level_db: float) -> np.ndarray:
+    """息成分を加算（level_db<0で適用）"""
+    signal = signal.astype(DTYPE, copy=False)
+    if level_db >= 0 or len(signal) == 0:
+        return signal
+
+    noise = RNG.standard_normal(len(signal)).astype(DTYPE)
+    rms = float(np.sqrt(np.mean(signal * signal) + 1e-12))
+    target = rms * _db_to_lin(level_db)
+    cur = float(np.sqrt(np.mean(noise * noise) + 1e-12))
+    if cur > 0:
+        signal = signal + noise * (target / cur)
+    return signal.astype(DTYPE, copy=False)
+
+
 # =======================
 # Filters
 # =======================
@@ -187,22 +212,8 @@ def synth_vowel(vowel: str = 'a', f0: float = 120.0, dur_s: float = 1.0, fs: int
     F = spec['F']
     BW = spec['BW']
 
-    y = np.zeros_like(src, dtype=DTYPE)
-    for fi, bwi in zip(F, BW):
-        Q = max(0.5, fi/float(bwi))
-        b0, b1, b2, a1, a2 = _bandpass_biquad_coeff(fi, Q, fs)
-        y += _biquad_process(src, b0, b1, b2, a1, a2)
-
-    y = _lip_radiation(y)
-
-    # 息ノイズを弱く加算
-    if breath_level_db < 0:
-        noise = RNG.standard_normal(len(y)).astype(DTYPE)
-        rms = np.sqrt(np.mean((y**2) + 1e-12))
-        target = rms * _db_to_lin(breath_level_db)
-        cur = np.sqrt(np.mean((noise**2) + 1e-12))
-        if cur > 0:
-            y += noise * (target/cur)
+    y = _apply_formant_filters(src, F, BW, fs)
+    y = _add_breath_noise(y, breath_level_db)
 
     return _normalize_peak(y, PEAK_DEFAULT).astype(DTYPE)
 
@@ -296,21 +307,8 @@ def _synth_vowel_fixed(F: Sequence[float], BW: Sequence[float], f0: float, dur_s
                        jitter_cents: float = 6.0, shimmer_db: float = 0.6, breath_level_db: float = -40.0) -> np.ndarray:
     """与えたフォルマントで固定合成（短区間）"""
     src = _glottal_source(f0, dur_s, fs, jitter_cents, shimmer_db)
-    n = int(dur_s * fs)
-    y = np.zeros(n, dtype=DTYPE)
-    for fi, bwi in zip(F, BW):
-        Q = max(0.5, fi/float(bwi))
-        b0, b1, b2, a1, a2 = _bandpass_biquad_coeff(fi, Q, fs)
-        y += _biquad_process(src, b0, b1, b2, a1, a2)
-    y = _lip_radiation(y)
-
-    if breath_level_db < 0:
-        noise = RNG.standard_normal(len(y)).astype(DTYPE)
-        rms = float(np.sqrt(np.mean(y*y) + 1e-12))
-        target = rms * _db_to_lin(breath_level_db)
-        cur = float(np.sqrt(np.mean(noise*noise) + 1e-12))
-        if cur > 0:
-            y += noise * (target/cur)
+    y = _apply_formant_filters(src, F, BW, fs)
+    y = _add_breath_noise(y, breath_level_db)
 
     return _normalize_peak(y, PEAK_DEFAULT).astype(DTYPE)
 
