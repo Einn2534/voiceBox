@@ -197,7 +197,10 @@ class Root(BoxLayout):
             try:
                 result = work()
             except Exception as exc:  # noqa: BLE001 - ユーザー通知のみ
-                Clock.schedule_once(lambda *_: self._set_status(f'Error: {exc}'), 0)
+                def handle_error(_dt, err=exc):
+                    self._set_status(f'Error: {err}')
+
+                Clock.schedule_once(handle_error, 0)
                 return
 
             Clock.schedule_once(lambda *_: on_success(result), 0)
