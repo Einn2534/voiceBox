@@ -218,21 +218,37 @@ def synth_vowel(vowel: str = 'a', f0: float = 120.0, dur_s: float = 1.0, fs: int
     return _normalize_peak(y, PEAK_DEFAULT).astype(DTYPE)
 
 
-def synth_fricative(consonant: str = 's', dur_s: float = 0.16, fs: int = 22050, level_db: float = -12.0) -> np.ndarray:
+def synth_fricative(consonant: str = 's', dur_s: float = 0.16, fs: int = 22050,
+                    level_db: float = -12.0) -> np.ndarray:
     """
-    無声摩擦音 /s/ の簡易実装（帯域ノイズ）
-    - MVPなので[s]のみ。
+    無声摩擦音の簡易実装。
+
+    Parameters
+    ----------
+    consonant:
+        's', 'sh', 'h', 'f' に対応。
+    dur_s:
+        ノイズ区間の長さ（秒）。
     """
     c = consonant.lower()
-    if c != 's':
-        raise ValueError("synth_fricative: supported only 's' for now.")
+    if c == 's':
+        fc, Q, liprad, lp_post = 6500.0, 3.0, True, None
+    elif c == 'sh':
+        fc, Q, liprad, lp_post = 3800.0, 2.4, True, 4200.0
+    elif c == 'h':
+        fc, Q, liprad, lp_post = 1800.0, 1.4, False, 2600.0
+    elif c == 'f':
+        fc, Q, liprad, lp_post = 950.0, 1.3, False, 2100.0
+    else:
+        raise ValueError("synth_fricative: supported consonants are 's','sh','h','f'.")
 
-    # /s/ は高域成分が強い（~5–8kHz付近）
-    fc = 6500.0
-    Q = 3.0
-    y = _gen_band_noise(dur_s, fs, fc, Q)
+    y = _gen_band_noise(dur_s, fs, fc, Q, liprad=liprad)
+    if lp_post is not None:
+        y = _one_pole_lp(y, fc=lp_post, fs=fs)
     y *= _db_to_lin(level_db)
-    y = _apply_fade(y, fs, attack_ms=5, release_ms=12)
+    attack = 6 if c in ('h', 'f') else 4
+    release = 16 if c in ('h', 'f') else 12
+    y = _apply_fade(y, fs, attack_ms=attack, release_ms=release)
     return _normalize_peak(y, 0.6).astype(DTYPE)
 
 
@@ -279,6 +295,57 @@ def synth_plosive(consonant: str = 't', fs: int = 22050,
     cons = np.concatenate([closure, burst, aspiration]).astype(DTYPE)
     cons *= _db_to_lin(level_db)
     return _normalize_peak(cons, 0.6)
+
+
+def synth_affricate(consonant: str = 'ch', fs: int = 22050,
+                    closure_ms: Optional[float] = None, fric_ms: Optional[float] = None,
+                    level_db: float = -11.0) -> np.ndarray:
+    """破擦音 /ch/, /ts/ の簡易版"""
+    c = consonant.lower()
+    if c not in ('ch', 'ts'):
+        raise ValueError("synth_affricate: supported only 'ch' or 'ts'.")
+
+    if c == 'ch':
+        closure_ms = 26 if closure_ms is None else closure_ms
+        burst_ms = 10
+        fric_ms = 95.0 if fric_ms is None else fric_ms
+        fric = synth_fricative('sh', dur_s=fric_ms/1000.0, fs=fs, level_db=-16.0)
+    else:
+        closure_ms = 24 if closure_ms is None else closure_ms
+        burst_ms = 9
+        fric_ms = 90.0 if fric_ms is None else fric_ms
+        fric = synth_fricative('s', dur_s=fric_ms/1000.0, fs=fs, level_db=-16.0)
+
+    base = synth_plosive('t', fs=fs, closure_ms=closure_ms,
+                         burst_ms=burst_ms, aspiration_ms=0.0,
+                         level_db=level_db)
+    y = _crossfade(base, fric, fs, overlap_ms=14)
+    return _normalize_peak(y, 0.6)
+
+
+NASAL_PRESETS: Dict[str, Dict[str, Sequence[float]]] = {
+    'n': {'F': [250.0, 1900.0, 2800.0], 'BW': [80.0, 160.0, 220.0]},
+    'm': {'F': [220.0, 1600.0, 2500.0], 'BW': [70.0, 150.0, 210.0]},
+}
+
+
+def synth_nasal(consonant: str = 'n', f0: float = 120.0, dur_ms: float = 90.0,
+                fs: int = 22050) -> np.ndarray:
+    """簡易的な鼻音 /n/, /m/"""
+    c = consonant.lower()
+    if c not in NASAL_PRESETS:
+        raise ValueError("synth_nasal: supported nasals are 'n' or 'm'.")
+
+    dur_s = max(20.0, float(dur_ms)) / 1000.0
+    spec = NASAL_PRESETS[c]
+    F = spec['F']
+    BW = spec['BW']
+    y = _synth_vowel_fixed(F, BW, f0, dur_s, fs,
+                           jitter_cents=4.0, shimmer_db=0.4, breath_level_db=-38.0)
+    y = _apply_fade(y, fs, attack_ms=8.0 if c == 'n' else 10.0,
+                    release_ms=22.0 if c == 'n' else 28.0)
+    gain = 0.6 if c == 'n' else 0.7
+    return _normalize_peak(y * gain, 0.5)
 
 
 # =======================
@@ -331,15 +398,37 @@ def synth_vowel_with_onset(vowel: str, f0: float, fs: int,
 # Composition (CV/フレーズ)
 # =======================
 
+GLIDE_ONSETS: Dict[str, Dict[str, Sequence[float]]] = {
+    'w': {
+        'a': [360.0, 950.0, 2550.0],
+        'i': [340.0, 1200.0, 2850.0],
+        'u': [330.0, 850.0, 2500.0],
+        'e': [350.0, 1100.0, 2700.0],
+        'o': [340.0, 950.0, 2550.0],
+    },
+    'y': {
+        'a': [360.0, 2100.0, 2900.0],
+        'i': [340.0, 2500.0, 3300.0],
+        'u': [335.0, 2200.0, 3100.0],
+        'e': [350.0, 2400.0, 3200.0],
+        'o': [340.0, 2150.0, 3050.0],
+    },
+}
+
+
+LIQUID_ONSETS: Dict[str, Sequence[float]] = {
+    'a': [480.0, 1350.0, 2100.0],
+    'i': [380.0, 1800.0, 2200.0],
+    'u': [420.0, 1500.0, 2100.0],
+    'e': [430.0, 1600.0, 2200.0],
+    'o': [460.0, 1400.0, 2150.0],
+}
+
+
 def synth_cv(cons: str, vowel: str, f0: float = 120.0, fs: int = 22050,
              pre_ms: int = 0, cons_ms: Optional[int] = None, vowel_ms: int = 240,
              overlap_ms: int = 30, use_onset_transition: bool = False) -> np.ndarray:
-    """
-    子音 + 母音（MVP）
-    - cons='s'：連続摩擦→母音。後端 20–max(20, overlap_ms) ms をクロスフェード
-    - cons='t','k'：閉鎖→バースト→アスピレーション→母音（ov を 6–12ms にクランプ）
-    - use_onset_transition=True で、簡易なフォルマント遷移を適用（/a/のみ例示）
-    """
+    """子音 + 母音（50音相当までカバー）"""
     c = cons.lower()
     v = vowel.lower()
     if v not in VOWEL_TABLE:
@@ -347,11 +436,14 @@ def synth_cv(cons: str, vowel: str, f0: float = 120.0, fs: int = 22050,
 
     head = np.zeros(_ms_to_samples(pre_ms, fs), dtype=DTYPE)
 
-    if c == 's':
-        fric_dur = (cons_ms / 1000.0) if cons_ms else 0.16
-        fric = synth_fricative('s', dur_s=fric_dur, fs=fs, level_db=-14.0)
+    if c in ('s', 'sh', 'h', 'f'):
+        level_lookup = {'s': -14.0, 'sh': -15.0, 'h': -18.0, 'f': -18.0}
+        default_ms = {'s': 160.0, 'sh': 150.0, 'h': 190.0, 'f': 170.0}
+        fric_ms = float(cons_ms) if cons_ms is not None else default_ms[c]
+        fric = synth_fricative(c, dur_s=fric_ms/1000.0, fs=fs,
+                               level_db=level_lookup[c])
         vow = synth_vowel(vowel=v, f0=f0, dur_s=vowel_ms/1000.0, fs=fs)
-        y = _crossfade(fric, vow, fs, overlap_ms=max(20, overlap_ms))
+        y = _crossfade(fric, vow, fs, overlap_ms=max(24, overlap_ms))
 
     elif c in ('t', 'k'):
         plosive = synth_plosive(c, fs=fs)
@@ -375,8 +467,47 @@ def synth_cv(cons: str, vowel: str, f0: float = 120.0, fs: int = 22050,
             pass
         y = _crossfade(plosive, vow, fs, overlap_ms=ov)
 
+    elif c in ('ch', 'ts'):
+        affric = synth_affricate(c, fs=fs)
+        vow = synth_vowel(vowel=v, f0=f0, dur_s=vowel_ms/1000.0, fs=fs)
+        y = _crossfade(affric, vow, fs, overlap_ms=max(12, min(overlap_ms, 18)))
+
+    elif c == 'n':
+        nasal_ms = float(cons_ms) if cons_ms is not None else 90.0
+        nasal = synth_nasal('n', f0=f0, dur_ms=nasal_ms, fs=fs)
+        vow = synth_vowel(vowel=v, f0=f0, dur_s=vowel_ms/1000.0, fs=fs)
+        y = _crossfade(nasal, vow, fs, overlap_ms=max(25, overlap_ms))
+
+    elif c == 'm':
+        nasal_ms = float(cons_ms) if cons_ms is not None else 110.0
+        nasal = synth_nasal('m', f0=f0, dur_ms=nasal_ms, fs=fs)
+        vow = synth_vowel(vowel=v, f0=f0, dur_s=vowel_ms/1000.0, fs=fs)
+        y = _crossfade(nasal, vow, fs, overlap_ms=max(28, overlap_ms))
+
+    elif c == 'w':
+        onset_ms = float(cons_ms) if cons_ms is not None else 60.0
+        onset_ms = max(30.0, min(onset_ms, float(vowel_ms) - 10.0))
+        F_on = GLIDE_ONSETS['w'].get(v, GLIDE_ONSETS['w']['a'])
+        y = synth_vowel_with_onset(v, f0, fs, total_ms=vowel_ms,
+                                   onset_ms=int(onset_ms), F_onset=F_on)
+
+    elif c == 'y':
+        onset_ms = float(cons_ms) if cons_ms is not None else 55.0
+        onset_ms = max(28.0, min(onset_ms, float(vowel_ms) - 12.0))
+        F_on = GLIDE_ONSETS['y'].get(v, GLIDE_ONSETS['y']['a'])
+        y = synth_vowel_with_onset(v, f0, fs, total_ms=vowel_ms,
+                                   onset_ms=int(onset_ms), F_onset=F_on)
+
+    elif c == 'r':
+        tap = synth_plosive('t', fs=fs, closure_ms=12.0, burst_ms=6.0,
+                            aspiration_ms=4.0, level_db=-20.0)
+        F_on = LIQUID_ONSETS.get(v, LIQUID_ONSETS['a'])
+        vow = synth_vowel_with_onset(v, f0, fs, total_ms=vowel_ms,
+                                     onset_ms=36, F_onset=F_on)
+        y = _crossfade(tap, vow, fs, overlap_ms=12)
+
     else:
-        raise ValueError("synth_cv: supported consonants are 's','t','k'")
+        raise ValueError("synth_cv: unsupported consonant for synth_cv")
 
     y = np.concatenate([head, y]).astype(DTYPE)
     return _normalize_peak(y, PEAK_DEFAULT)
