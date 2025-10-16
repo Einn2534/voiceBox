@@ -15,9 +15,82 @@ from kivy.uix.checkbox import CheckBox
 from kivy.uix.label import Label
 from kivy.uix.slider import Slider
 
-from dsp import synth_cv_to_wav, synth_phrase_to_wav, synth_vowel, write_wav
+from dsp import synth_cv_to_wav, synth_nasal, synth_phrase_to_wav, synth_vowel, write_wav
 
 FS = 22050  # サンプリング周波数（統一）
+
+GOJUON_ROWS: Sequence[Sequence[Tuple[str, Tuple[str, str]] | None]] = [
+    [
+        ('KA', ('k', 'a')),
+        ('KI', ('k', 'i')),
+        ('KU', ('k', 'u')),
+        ('KE', ('k', 'e')),
+        ('KO', ('k', 'o')),
+    ],
+    [
+        ('SA', ('s', 'a')),
+        ('SHI', ('sh', 'i')),
+        ('SU', ('s', 'u')),
+        ('SE', ('s', 'e')),
+        ('SO', ('s', 'o')),
+    ],
+    [
+        ('TA', ('t', 'a')),
+        ('CHI', ('ch', 'i')),
+        ('TSU', ('ts', 'u')),
+        ('TE', ('t', 'e')),
+        ('TO', ('t', 'o')),
+    ],
+    [
+        ('NA', ('n', 'a')),
+        ('NI', ('n', 'i')),
+        ('NU', ('n', 'u')),
+        ('NE', ('n', 'e')),
+        ('NO', ('n', 'o')),
+    ],
+    [
+        ('HA', ('h', 'a')),
+        ('HI', ('h', 'i')),
+        ('FU', ('f', 'u')),
+        ('HE', ('h', 'e')),
+        ('HO', ('h', 'o')),
+    ],
+    [
+        ('MA', ('m', 'a')),
+        ('MI', ('m', 'i')),
+        ('MU', ('m', 'u')),
+        ('ME', ('m', 'e')),
+        ('MO', ('m', 'o')),
+    ],
+    [
+        ('YA', ('y', 'a')),
+        None,
+        ('YU', ('y', 'u')),
+        None,
+        ('YO', ('y', 'o')),
+    ],
+    [
+        ('RA', ('r', 'a')),
+        ('RI', ('r', 'i')),
+        ('RU', ('r', 'u')),
+        ('RE', ('r', 'e')),
+        ('RO', ('r', 'o')),
+    ],
+    [
+        ('WA', ('w', 'a')),
+        None,
+        None,
+        None,
+        ('WO', ('w', 'o')),
+    ],
+    [
+        ('N', ('nasal', 'n')),
+        None,
+        None,
+        None,
+        None,
+    ],
+]
 
 
 class Root(BoxLayout):
@@ -67,12 +140,9 @@ class Root(BoxLayout):
         row3.add_widget(self.status)
         self.add_widget(row3)
 
-        # ---- 子音 + 母音（SA / TA / KA） ----
-        cons_primary = [('SA', ('s', 'a')), ('TA', ('t', 'a')), ('KA', ('k', 'a'))]
-        cons_extra = [('NA', ('n', 'a')), ('NI', ('n', 'i')), ('NU', ('n', 'u')),
-                      ('NE', ('n', 'e')), ('NO', ('n', 'o')), ('WA', ('w', 'a'))]
-        self._add_button_row(self._build_cv_specs(cons_primary))
-        self._add_button_row(self._build_cv_specs(cons_extra))
+        # ---- 50音テーブル ----
+        for entries in GOJUON_ROWS:
+            self._add_gojuon_row(entries)
 
         self.sound = None
 
@@ -127,6 +197,19 @@ class Root(BoxLayout):
             )
 
         self._play_async(f'{c}{v}.wav', build, f'Played {label}')
+
+    def speak_nasal(self, consonant: str):
+        consonant = consonant.lower()
+        label = 'N' if consonant == 'n' else consonant.upper()
+        self._set_status(f'Synth {label}...')
+        f0 = float(self.pitch.value)
+        dur = max(80, int(self.vowel_ms.value * 0.6))
+
+        def build(path: str) -> str:
+            y = synth_nasal(consonant, f0=f0, dur_ms=dur, fs=FS)
+            return write_wav(path, y, fs=FS)
+
+        self._play_async(f'nasal_{consonant}.wav', build, f'Played {label}')
 
     def play_sequence(self):
         self._set_status('Synth sequence...')
@@ -207,15 +290,32 @@ class Root(BoxLayout):
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _build_cv_specs(self, specs: Iterable[Tuple[str, Tuple[str, str]]]) -> Sequence[Tuple[str, Callable[[], None]]]:
-        return [
-            (label, lambda cc=c, vv=v: self.speak_cv(cc, vv))
-            for label, (c, v) in specs
-        ]
-
     @staticmethod
     def _wrap_button_callback(callback: Callable[[], None]) -> Callable[..., None]:
         return lambda *_: callback()
+
+    def _add_gojuon_row(self, entries: Sequence[Tuple[str, Tuple[str, str]] | None]) -> None:
+        row = BoxLayout(size_hint_y=None, height='48dp', spacing=8)
+        for cell in entries:
+            if cell is None:
+                row.add_widget(Label(text=''))
+                continue
+
+            text, payload = cell
+            btn = Button(text=text)
+
+            if payload[0] == 'nasal':
+                btn.bind(on_release=self._wrap_button_callback(
+                    lambda cc=payload[1]: self.speak_nasal(cc)
+                ))
+            else:
+                btn.bind(on_release=self._wrap_button_callback(
+                    lambda cc=payload[0], vv=payload[1]: self.speak_cv(cc, vv)
+                ))
+
+            row.add_widget(btn)
+
+        self.add_widget(row)
 
 
 class AppVocal(App):
