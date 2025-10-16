@@ -236,7 +236,7 @@ def synth_fricative(consonant: str = 's', dur_s: float = 0.16, fs: int = 22050,
     elif c == 'sh':
         fc, Q, liprad, lp_post = 3800.0, 2.4, True, 4200.0
     elif c == 'h':
-        fc, Q, liprad, lp_post = 1800.0, 1.4, False, 2600.0
+        fc, Q, liprad, lp_post = 1800.0, 1.4, False, 2300.0
     elif c == 'f':
         fc, Q, liprad, lp_post = 950.0, 1.3, False, 2100.0
     else:
@@ -245,12 +245,16 @@ def synth_fricative(consonant: str = 's', dur_s: float = 0.16, fs: int = 22050,
     y = _gen_band_noise(dur_s, fs, fc, Q, liprad=liprad)
     if lp_post is not None:
         y = _one_pole_lp(y, fc=lp_post, fs=fs)
+    if c == 'h':
+        # H の息漏れは高域を更に丸めて「ホワイトノイズ感」を抑える
+        y = _one_pole_lp(y, fc=1700.0, fs=fs)
     attack = 6 if c in ('h', 'f') else 4
     release = 16 if c in ('h', 'f') else 12
     y = _apply_fade(y, fs, attack_ms=attack, release_ms=release)
 
     # 正規化のあとで音量ゲインを掛け、lookup テーブルの dB 指定が有効に働くようにする。
-    y = _normalize_peak(y, 0.6).astype(DTYPE, copy=False)
+    peak_target = 0.6 if c not in ('h', 'f') else (0.5 if c == 'h' else 0.55)
+    y = _normalize_peak(y, peak_target).astype(DTYPE, copy=False)
     gain = _db_to_lin(level_db)
     if gain != 1.0:
         y = y * gain
@@ -442,7 +446,7 @@ def synth_cv(cons: str, vowel: str, f0: float = 120.0, fs: int = 22050,
     head = np.zeros(_ms_to_samples(pre_ms, fs), dtype=DTYPE)
 
     if c in ('s', 'sh', 'h', 'f'):
-        level_lookup = {'s': -14.0, 'sh': -15.0, 'h': -18.0, 'f': -18.0}
+        level_lookup = {'s': -14.0, 'sh': -15.0, 'h': -22.0, 'f': -18.0}
         default_ms = {'s': 160.0, 'sh': 150.0, 'h': 190.0, 'f': 170.0}
         fric_ms = float(cons_ms) if cons_ms is not None else default_ms[c]
         fric = synth_fricative(c, dur_s=fric_ms/1000.0, fs=fs,
