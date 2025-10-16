@@ -245,11 +245,16 @@ def synth_fricative(consonant: str = 's', dur_s: float = 0.16, fs: int = 22050,
     y = _gen_band_noise(dur_s, fs, fc, Q, liprad=liprad)
     if lp_post is not None:
         y = _one_pole_lp(y, fc=lp_post, fs=fs)
-    y *= _db_to_lin(level_db)
     attack = 6 if c in ('h', 'f') else 4
     release = 16 if c in ('h', 'f') else 12
     y = _apply_fade(y, fs, attack_ms=attack, release_ms=release)
-    return _normalize_peak(y, 0.6).astype(DTYPE)
+
+    # 正規化のあとで音量ゲインを掛け、lookup テーブルの dB 指定が有効に働くようにする。
+    y = _normalize_peak(y, 0.6).astype(DTYPE, copy=False)
+    gain = _db_to_lin(level_db)
+    if gain != 1.0:
+        y = y * gain
+    return y.astype(DTYPE, copy=False)
 
 
 def synth_plosive(consonant: str = 't', fs: int = 22050,
