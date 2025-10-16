@@ -24,7 +24,7 @@ voiceBox/
   - `synth_vowel`, `synth_cv`, `synth_phrase_to_wav` といった高レベルの合成 API
   - `write_wav` による 16bit PCM WAV 出力
 - `VOWEL_TABLE` で母音ごとのフォルマントや帯域幅が定義されています。追加・調整時はこのテーブルを更新します。
-- 子音は `/s/`, `/t/`, `/k/` のみ実装済みで、`synth_fricative` や `synth_plosive` を経由して合成されます。
+- 子音は `/s/`, `/t/`, `/k/` に加えて `/n/`, `/w/` を実装済みで、摩擦音・破裂音・鼻音・半母音の各モジュールを経由して合成されます。
 
 ### 3. サンプリング周波数と正規化
 - 全体で `FS = 22050` Hz を前提としており、`main.py`・`dsp.py` 双方で共有しています。

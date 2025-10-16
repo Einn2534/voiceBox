@@ -281,6 +281,22 @@ def synth_plosive(consonant: str = 't', fs: int = 22050,
     return _normalize_peak(cons, 0.6)
 
 
+def synth_nasal(consonant: str = 'n', f0: float = 120.0, dur_ms: float = 90.0,
+                fs: int = 22050) -> np.ndarray:
+    """簡易的な鼻音 /n/。低フォルマントで短い持続を作る"""
+    c = consonant.lower()
+    if c != 'n':
+        raise ValueError("synth_nasal: supported only 'n'.")
+
+    dur_s = max(20.0, float(dur_ms)) / 1000.0
+    F = [250.0, 1900.0, 2800.0]
+    BW = [80.0, 160.0, 220.0]
+    y = _synth_vowel_fixed(F, BW, f0, dur_s, fs,
+                           jitter_cents=4.0, shimmer_db=0.4, breath_level_db=-38.0)
+    y = _apply_fade(y, fs, attack_ms=8.0, release_ms=22.0)
+    return _normalize_peak(y * 0.6, 0.5)
+
+
 # =======================
 # Building Blocks
 # =======================
@@ -375,8 +391,28 @@ def synth_cv(cons: str, vowel: str, f0: float = 120.0, fs: int = 22050,
             pass
         y = _crossfade(plosive, vow, fs, overlap_ms=ov)
 
+    elif c == 'n':
+        nasal_ms = float(cons_ms) if cons_ms is not None else 90.0
+        nasal = synth_nasal('n', f0=f0, dur_ms=nasal_ms, fs=fs)
+        vow = synth_vowel(vowel=v, f0=f0, dur_s=vowel_ms/1000.0, fs=fs)
+        y = _crossfade(nasal, vow, fs, overlap_ms=max(25, overlap_ms))
+
+    elif c == 'w':
+        onset_lookup = {
+            'a': [360.0, 950.0, 2550.0],
+            'i': [340.0, 1200.0, 2850.0],
+            'u': [330.0, 850.0, 2500.0],
+            'e': [350.0, 1100.0, 2700.0],
+            'o': [340.0, 950.0, 2550.0],
+        }
+        onset_ms = float(cons_ms) if cons_ms is not None else 60.0
+        onset_ms = max(30.0, min(onset_ms, float(vowel_ms) - 10.0))
+        F_on = onset_lookup.get(v, onset_lookup['a'])
+        y = synth_vowel_with_onset(v, f0, fs, total_ms=vowel_ms,
+                                   onset_ms=int(onset_ms), F_onset=F_on)
+
     else:
-        raise ValueError("synth_cv: supported consonants are 's','t','k'")
+        raise ValueError("synth_cv: supported consonants are 's','t','k','n','w'")
 
     y = np.concatenate([head, y]).astype(DTYPE)
     return _normalize_peak(y, PEAK_DEFAULT)
