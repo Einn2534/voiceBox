@@ -445,14 +445,38 @@ def synth_cv(cons: str, vowel: str, f0: float = 120.0, fs: int = 22050,
 
     head = np.zeros(_ms_to_samples(pre_ms, fs), dtype=DTYPE)
 
-    if c in ('s', 'sh', 'h', 'f'):
-        level_lookup = {'s': -14.0, 'sh': -15.0, 'h': -22.0, 'f': -18.0}
-        default_ms = {'s': 160.0, 'sh': 150.0, 'h': 190.0, 'f': 170.0}
+    if c in ('s', 'sh'):
+        level_lookup = {'s': -14.0, 'sh': -15.0}
+        default_ms = {'s': 160.0, 'sh': 150.0}
         fric_ms = float(cons_ms) if cons_ms is not None else default_ms[c]
         fric = synth_fricative(c, dur_s=fric_ms/1000.0, fs=fs,
                                level_db=level_lookup[c])
         vow = synth_vowel(vowel=v, f0=f0, dur_s=vowel_ms/1000.0, fs=fs)
         y = _crossfade(fric, vow, fs, overlap_ms=max(24, overlap_ms))
+
+    elif c in ('h', 'f'):
+        # ハ行は吐息ノイズを除去し、子音区間は無音で保持する
+        default_ms = {'h': 190.0, 'f': 170.0}
+        cons_len_ms = float(cons_ms) if cons_ms is not None else default_ms[c]
+        cons_len_ms = max(0.0, cons_len_ms)
+        silence = np.zeros(_ms_to_samples(cons_len_ms, fs), dtype=DTYPE)
+
+        vow = synth_vowel(vowel=v, f0=f0, dur_s=vowel_ms/1000.0, fs=fs)
+
+        if len(silence) > 0:
+            try:
+                req_ov = float(overlap_ms)
+            except Exception:
+                req_ov = 12.0
+            ov_ms = min(12.0, cons_len_ms, max(0.0, req_ov))
+            if ov_ms > 0.0:
+                y = _crossfade(silence, vow, fs, overlap_ms=ov_ms)
+            else:
+                y = np.concatenate([silence, vow]).astype(DTYPE)
+        else:
+            y = vow
+
+        y = _apply_fade(y, fs, attack_ms=8, release_ms=12)
 
     elif c in ('t', 'k'):
         plosive = synth_plosive(c, fs=fs)
