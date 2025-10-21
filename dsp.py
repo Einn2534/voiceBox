@@ -423,24 +423,26 @@ def synth_vowel_with_onset(vowel: str, f0: float, fs: int,
 # Composition (CV/フレーズ)
 # =======================
 
+# ===== 置き換え: GLIDE_ONSETS（/w/ のF1/F2を少し上げる、/y/はF1を少し上げる）=====
 GLIDE_ONSETS: Dict[str, Dict[str, Sequence[float]]] = {
-    # 準母音はフォルマント遷移を十分に強調しないと鼻音に近い響きになるため、
-    # 特に F2 を大きく変化させて /m/ との知覚差を確保する。
     'w': {
-        'a': [340.0, 620.0, 2250.0],
-        'i': [320.0, 780.0, 2500.0],
-        'u': [300.0, 540.0, 2150.0],
-        'e': [330.0, 700.0, 2350.0],
-        'o': [330.0, 630.0, 2300.0],
+        # 旧: F1≈300台/F2≈600-700台 → 鼻音域と近くなるので少し離す
+        'a': [420.0, 1000.0, 2300.0],
+        'i': [400.0, 1200.0, 2500.0],
+        'u': [380.0,  900.0, 2200.0],
+        'e': [410.0, 1100.0, 2350.0],
+        'o': [420.0,  950.0, 2300.0],
     },
     'y': {
-        'a': [320.0, 2400.0, 3200.0],
-        'i': [300.0, 2700.0, 3400.0],
-        'u': [310.0, 2450.0, 3200.0],
-        'e': [320.0, 2600.0, 3350.0],
-        'o': [320.0, 2350.0, 3100.0],
+        # /y/ は F2 は既に高いので F1 をやや上げて nasal 感を避ける
+        'a': [380.0, 2600.0, 3300.0],
+        'i': [360.0, 2900.0, 3500.0],
+        'u': [370.0, 2650.0, 3300.0],
+        'e': [380.0, 2800.0, 3400.0],
+        'o': [380.0, 2500.0, 3200.0],
     },
 }
+
 
 
 LIQUID_ONSETS: Dict[str, Sequence[float]] = {
@@ -535,21 +537,30 @@ def synth_cv(cons: str, vowel: str, f0: float = 120.0, fs: int = 22050,
         vow = synth_vowel(vowel=v, f0=f0, dur_s=vowel_ms/1000.0, fs=fs)
         y = _crossfade(nasal, vow, fs, overlap_ms=max(28, overlap_ms))
 
+   # ===== 置き換え: synth_cv内の 'w' と 'y' 分岐 =====
     elif c == 'w':
-        onset_ms = float(cons_ms) if cons_ms is not None else 62.0
-        onset_ms = max(28.0, min(onset_ms, float(vowel_ms) - 8.0))
+        # onset を短め＆帯域幅を“広げる”（=1.0超）
+        onset_ms = float(cons_ms) if cons_ms is not None else 44.0
+        onset_ms = max(24.0, min(onset_ms, float(vowel_ms) - 8.0))
         F_on = GLIDE_ONSETS['w'].get(v, GLIDE_ONSETS['w']['a'])
         y = synth_vowel_with_onset(v, f0, fs, total_ms=vowel_ms,
-                                   onset_ms=int(onset_ms), F_onset=F_on,
-                                   onset_bw_scale=0.65)
+                            onset_ms=int(onset_ms), F_onset=F_on,
+                            onset_bw_scale=1.18)  # 旧: 0.65
+        # 高域の手がかりを少し足す（過剰な歯擦感は出ない程度）
+        y = _pre_emphasis(y, a=0.86)
+        y = _add_breath_noise(y, level_db=-36.0)
+        y = _normalize_peak(y, PEAK_DEFAULT)
 
-    elif c == 'y':
-        onset_ms = float(cons_ms) if cons_ms is not None else 58.0
+    elif c == 'y': 
+        onset_ms = float(cons_ms) if cons_ms is not None else 40.0
         onset_ms = max(24.0, min(onset_ms, float(vowel_ms) - 10.0))
         F_on = GLIDE_ONSETS['y'].get(v, GLIDE_ONSETS['y']['a'])
         y = synth_vowel_with_onset(v, f0, fs, total_ms=vowel_ms,
-                                   onset_ms=int(onset_ms), F_onset=F_on,
-                                   onset_bw_scale=0.72)
+                        onset_ms=int(onset_ms), F_onset=F_on,
+                        onset_bw_scale=1.10)  # 旧: 0.72
+        y = _pre_emphasis(y, a=0.84)
+        y = _add_breath_noise(y, level_db=-38.0)
+        y = _normalize_peak(y, PEAK_DEFAULT)
 
     elif c == 'r':
         tap = synth_plosive('t', fs=fs, closure_ms=12.0, burst_ms=6.0,
@@ -607,3 +618,13 @@ def write_wav(path: str, data: np.ndarray, fs: int = 22050) -> str:
         wf.setframerate(fs)
         wf.writeframes(data16.tobytes())
     return os.path.abspath(path)
+
+# ===== 追加: 高域を少し持ち上げるプレエンファシス =====
+def _pre_emphasis(x: np.ndarray, a: float = 0.85) -> np.ndarray:
+    """y[n] = x[n] - a*x[n-1]（高域をわずかに強調）"""
+    if len(x) == 0:
+        return x
+    y = np.empty_like(x, dtype=DTYPE)
+    y[0] = x[0]
+    y[1:] = x[1:] - a * x[:-1]
+    return y.astype(DTYPE, copy=False)
