@@ -15,7 +15,9 @@ from kivy.uix.checkbox import CheckBox
 from kivy.uix.label import Label
 from kivy.uix.slider import Slider
 
-from dsp import synth_cv_to_wav, synth_nasal, synth_phrase_to_wav, synth_vowel, write_wav
+import numpy as np
+
+from dsp import synth_cv, synth_cv_to_wav, synth_nasal, synth_phrase_to_wav, synth_vowel, write_wav
 
 FS = 22050  # サンプリング周波数（統一）
 
@@ -114,9 +116,9 @@ class Root(BoxLayout):
         )
         self.vowel_ms, self.lbl_vm = self._add_slider(
             label_template='Vowel(ms): {value}',
-            min_value=180,
-            max_value=320,
-            value=260,
+            min_value=120,
+            max_value=300,
+            value=200,
         )
 
         # ---- Onset（t/k 強調） ----
@@ -135,6 +137,10 @@ class Root(BoxLayout):
         btn_seq = Button(text='Play A-I-U-E-O')
         btn_seq.bind(on_release=lambda *_: self.play_sequence())
         row3.add_widget(btn_seq)
+
+        btn_love = Button(text='Say あいしてる')
+        btn_love.bind(on_release=lambda *_: self.speak_aishiteru())
+        row3.add_widget(btn_love)
 
         self.status = Label(text='Ready')
         row3.add_widget(self.status)
@@ -165,9 +171,10 @@ class Root(BoxLayout):
         v = v.lower()
         self._set_status(f'Synth {v}...')
         f0 = float(self.pitch.value)
+        dur_s = max(0.12, float(self.vowel_ms.value) / 1000.0)
 
         def build(path: str) -> str:
-            y = synth_vowel(vowel=v, f0=f0, dur_s=0.6, fs=FS)
+            y = synth_vowel(vowel=v, f0=f0, dur_s=dur_s, fs=FS)
             return write_wav(path, y, fs=FS)
 
         self._play_async(f'vowel_{v}.wav', build, f'Played {v.upper()}')
@@ -211,13 +218,51 @@ class Root(BoxLayout):
 
         self._play_async(f'nasal_{consonant}.wav', build, f'Played {label}')
 
+    def speak_aishiteru(self):
+        self._set_status('Synth あいしてる...')
+        f0 = float(self.pitch.value)
+        ov = int(self.overlap.value)
+        vms = int(self.vowel_ms.value)
+        use_onset = bool(self.onset.active)
+
+        def build(path: str) -> str:
+            def pause(ms: float) -> None:
+                samples = int(FS * (ms / 1000.0))
+                if samples > 0:
+                    segments.append(np.zeros(samples, dtype=np.float32))
+
+            vowel_sec = max(0.12, vms / 1000.0)
+            segments = [
+                synth_vowel('a', f0=f0, dur_s=vowel_sec, fs=FS),
+            ]
+            pause(45.0)
+            segments.append(synth_vowel('i', f0=f0, dur_s=max(0.1, vowel_sec * 0.8), fs=FS))
+            pause(70.0)
+
+            cv_kwargs = dict(f0=f0, fs=FS, vowel_ms=vms, overlap_ms=ov, use_onset_transition=use_onset)
+            segments.append(synth_cv('sh', 'i', **cv_kwargs))
+            pause(50.0)
+            segments.append(synth_cv('t', 'e', **cv_kwargs))
+            pause(35.0)
+            ru_vowel = vms + max(40, vms // 3)
+            segments.append(
+                synth_cv('r', 'u', f0=f0, fs=FS, vowel_ms=ru_vowel, overlap_ms=ov, use_onset_transition=use_onset)
+            )
+
+            audio = np.concatenate(segments).astype(np.float32, copy=False)
+            return write_wav(path, audio, fs=FS)
+
+        self._play_async('phrase_aishiteru.wav', build, 'Played あいしてる')
+
     def play_sequence(self):
         self._set_status('Synth sequence...')
         f0 = float(self.pitch.value)
 
         def build(path: str) -> str:
             vowels: Sequence[str] = ['a', 'i', 'u', 'e', 'o']
-            return synth_phrase_to_wav(vowels, path, f0=f0, unit_ms=250, gap_ms=60, fs=FS)
+            unit_ms = max(120, int(self.vowel_ms.value))
+            gap_ms = max(40, int(unit_ms * 0.25))
+            return synth_phrase_to_wav(vowels, path, f0=f0, unit_ms=unit_ms, gap_ms=gap_ms, fs=FS)
 
         self._play_async('sequence_aiueo.wav', build, 'Played A-I-U-E-O')
 
