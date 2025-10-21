@@ -391,16 +391,32 @@ def _synth_vowel_fixed(F: Sequence[float], BW: Sequence[float], f0: float, dur_s
 
 def synth_vowel_with_onset(vowel: str, f0: float, fs: int,
                            total_ms: int = 240, onset_ms: int = 45,
-                           F_onset: Optional[Sequence[float]] = None) -> np.ndarray:
+                           F_onset: Optional[Sequence[float]] = None,
+                           onset_bw_scale: float = 0.85) -> np.ndarray:
     """母音先頭だけフォルマント遷移を与える簡易版"""
     spec = VOWEL_TABLE[vowel]
     F_t, BW_t = spec['F'], spec['BW']
     if not F_onset:
         return synth_vowel(vowel=vowel, f0=f0, dur_s=total_ms/1000.0, fs=fs)
 
-    y_on = _synth_vowel_fixed(F_onset, BW_t, f0, onset_ms/1000.0, fs)
-    y_rest = _synth_vowel_fixed(F_t, BW_t, f0, total_ms/1000.0, fs)
-    return _crossfade(y_on, y_rest, fs, overlap_ms=10)
+    total_ms = int(max(10, total_ms))
+    onset_ms = int(max(1, min(onset_ms, total_ms - 1)))
+    sustain_ms = max(0, total_ms - onset_ms)
+
+    BW_on = [bw * float(onset_bw_scale) for bw in BW_t]
+    y_on = _synth_vowel_fixed(F_onset, BW_on, f0, onset_ms/1000.0, fs)
+    y_on = _apply_fade(y_on, fs, attack_ms=6.0, release_ms=min(12.0, onset_ms * 0.5))
+
+    if sustain_ms <= 0:
+        return y_on
+
+    ov_ms = min(max(6.0, onset_ms * 0.45), 14.0, float(sustain_ms))
+    rest_len_ms = sustain_ms + max(0.0, ov_ms)
+
+    y_rest = _synth_vowel_fixed(F_t, BW_t, f0, rest_len_ms/1000.0, fs)
+    y_rest = _apply_fade(y_rest, fs, attack_ms=4.0, release_ms=12.0)
+
+    return _crossfade(y_on, y_rest, fs, overlap_ms=ov_ms)
 
 
 # =======================
@@ -408,19 +424,21 @@ def synth_vowel_with_onset(vowel: str, f0: float, fs: int,
 # =======================
 
 GLIDE_ONSETS: Dict[str, Dict[str, Sequence[float]]] = {
+    # 準母音はフォルマント遷移を十分に強調しないと鼻音に近い響きになるため、
+    # 特に F2 を大きく変化させて /m/ との知覚差を確保する。
     'w': {
-        'a': [360.0, 950.0, 2550.0],
-        'i': [340.0, 1200.0, 2850.0],
-        'u': [330.0, 850.0, 2500.0],
-        'e': [350.0, 1100.0, 2700.0],
-        'o': [340.0, 950.0, 2550.0],
+        'a': [340.0, 620.0, 2250.0],
+        'i': [320.0, 780.0, 2500.0],
+        'u': [300.0, 540.0, 2150.0],
+        'e': [330.0, 700.0, 2350.0],
+        'o': [330.0, 630.0, 2300.0],
     },
     'y': {
-        'a': [360.0, 2100.0, 2900.0],
-        'i': [340.0, 2500.0, 3300.0],
-        'u': [335.0, 2200.0, 3100.0],
-        'e': [350.0, 2400.0, 3200.0],
-        'o': [340.0, 2150.0, 3050.0],
+        'a': [320.0, 2400.0, 3200.0],
+        'i': [300.0, 2700.0, 3400.0],
+        'u': [310.0, 2450.0, 3200.0],
+        'e': [320.0, 2600.0, 3350.0],
+        'o': [320.0, 2350.0, 3100.0],
     },
 }
 
@@ -518,18 +536,20 @@ def synth_cv(cons: str, vowel: str, f0: float = 120.0, fs: int = 22050,
         y = _crossfade(nasal, vow, fs, overlap_ms=max(28, overlap_ms))
 
     elif c == 'w':
-        onset_ms = float(cons_ms) if cons_ms is not None else 60.0
-        onset_ms = max(30.0, min(onset_ms, float(vowel_ms) - 10.0))
+        onset_ms = float(cons_ms) if cons_ms is not None else 62.0
+        onset_ms = max(28.0, min(onset_ms, float(vowel_ms) - 8.0))
         F_on = GLIDE_ONSETS['w'].get(v, GLIDE_ONSETS['w']['a'])
         y = synth_vowel_with_onset(v, f0, fs, total_ms=vowel_ms,
-                                   onset_ms=int(onset_ms), F_onset=F_on)
+                                   onset_ms=int(onset_ms), F_onset=F_on,
+                                   onset_bw_scale=0.65)
 
     elif c == 'y':
-        onset_ms = float(cons_ms) if cons_ms is not None else 55.0
-        onset_ms = max(28.0, min(onset_ms, float(vowel_ms) - 12.0))
+        onset_ms = float(cons_ms) if cons_ms is not None else 58.0
+        onset_ms = max(24.0, min(onset_ms, float(vowel_ms) - 10.0))
         F_on = GLIDE_ONSETS['y'].get(v, GLIDE_ONSETS['y']['a'])
         y = synth_vowel_with_onset(v, f0, fs, total_ms=vowel_ms,
-                                   onset_ms=int(onset_ms), F_onset=F_on)
+                                   onset_ms=int(onset_ms), F_onset=F_on,
+                                   onset_bw_scale=0.72)
 
     elif c == 'r':
         tap = synth_plosive('t', fs=fs, closure_ms=12.0, burst_ms=6.0,
