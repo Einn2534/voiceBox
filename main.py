@@ -131,6 +131,10 @@ class Root(BoxLayout):
         # ---- 簡易ボタン（母音）----
         vowel_specs = [(v.upper(), lambda vv=v: self.speak_vowel(vv)) for v in ['a', 'i', 'u', 'e', 'o']]
         self._add_button_row(vowel_specs)
+        
+        # ---- 50音テーブル ----
+        for entries in GOJUON_ROWS:
+            self._add_gojuon_row(entries)
 
         # ---- 5母音並び 再生 + ステータス ----
         row3 = BoxLayout(size_hint_y=None, height='48dp', spacing=8)
@@ -146,9 +150,7 @@ class Root(BoxLayout):
         row3.add_widget(self.status)
         self.add_widget(row3)
 
-        # ---- 50音テーブル ----
-        for entries in GOJUON_ROWS:
-            self._add_gojuon_row(entries)
+
 
         self.sound = None
 
