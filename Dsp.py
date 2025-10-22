@@ -25,6 +25,56 @@ VOWEL_TABLE: Dict[str, Dict[str, Sequence[float]]] = {
     'o': {'F': [450, 800, 2830],  'BW': [80, 110, 150]},
 }
 
+# ローマ字トークン → (子音, 母音) の変換テーブル
+CV_TOKEN_MAP: Dict[str, Tuple[str, str]] = {
+    'ka': ('k', 'a'),
+    'ki': ('k', 'i'),
+    'ku': ('k', 'u'),
+    'ke': ('k', 'e'),
+    'ko': ('k', 'o'),
+    'sa': ('s', 'a'),
+    'shi': ('sh', 'i'),
+    'su': ('s', 'u'),
+    'se': ('s', 'e'),
+    'so': ('s', 'o'),
+    'ta': ('t', 'a'),
+    'chi': ('ch', 'i'),
+    'tsu': ('ts', 'u'),
+    'te': ('t', 'e'),
+    'to': ('t', 'o'),
+    'na': ('n', 'a'),
+    'ni': ('n', 'i'),
+    'nu': ('n', 'u'),
+    'ne': ('n', 'e'),
+    'no': ('n', 'o'),
+    'ha': ('h', 'a'),
+    'hi': ('h', 'i'),
+    'fu': ('f', 'u'),
+    'he': ('h', 'e'),
+    'ho': ('h', 'o'),
+    'ma': ('m', 'a'),
+    'mi': ('m', 'i'),
+    'mu': ('m', 'u'),
+    'me': ('m', 'e'),
+    'mo': ('m', 'o'),
+    'ya': ('y', 'a'),
+    'yu': ('y', 'u'),
+    'yo': ('y', 'o'),
+    'ra': ('r', 'a'),
+    'ri': ('r', 'i'),
+    'ru': ('r', 'u'),
+    're': ('r', 'e'),
+    'ro': ('r', 'o'),
+    'wa': ('w', 'a'),
+    'wo': ('w', 'o'),
+}
+
+NASAL_TOKEN_MAP: Dict[str, str] = {
+    'n': 'n',
+    'nn': 'n',
+    'm': 'm',
+}
+
 DTYPE = np.float32
 PEAK_DEFAULT = 0.9
 
@@ -678,6 +728,92 @@ def synth_phrase_to_wav(
         buffer = [np.zeros(int(sampleRate * 0.3), dtype=DTYPE)]
     concatenated = np.concatenate(buffer)
     return write_wav(outPath, concatenated, sampleRate=sampleRate)
+
+
+def synth_token_sequence(
+    tokens: Sequence[str],
+    *,
+    f0: float = 120.0,
+    sampleRate: int = 22050,
+    vowelMilliseconds: int = 240,
+    overlapMilliseconds: int = 30,
+    gapMilliseconds: int = 40,
+    useOnsetTransition: bool = False,
+) -> np.ndarray:
+    """ローマ字トークン列から波形を生成するヘルパー。"""
+
+    segments: list[np.ndarray] = []
+    gapSamples = _ms_to_samples(max(0, int(gapMilliseconds)), sampleRate)
+    vowelSeconds = max(0.12, float(vowelMilliseconds) / 1000.0)
+    nasalDuration = max(80, int(vowelMilliseconds * 0.6))
+
+    for token in tokens:
+        normalized = token.strip().lower()
+        if not normalized:
+            continue
+
+        if normalized in CV_TOKEN_MAP:
+            consonantKey, vowelKey = CV_TOKEN_MAP[normalized]
+            segment = synth_cv(
+                consonantKey,
+                vowelKey,
+                f0=f0,
+                sampleRate=sampleRate,
+                vowelMilliseconds=vowelMilliseconds,
+                overlapMilliseconds=overlapMilliseconds,
+                useOnsetTransition=useOnsetTransition,
+            )
+        elif normalized in VOWEL_TABLE:
+            segment = synth_vowel(
+                normalized,
+                f0=f0,
+                durationSeconds=vowelSeconds,
+                sampleRate=sampleRate,
+            )
+        elif normalized in NASAL_TOKEN_MAP:
+            segment = synth_nasal(
+                NASAL_TOKEN_MAP[normalized],
+                f0=f0,
+                durationMilliseconds=nasalDuration,
+                sampleRate=sampleRate,
+            )
+        else:
+            raise ValueError(f"Unsupported token '{token}' for synthesis")
+
+        if segments and gapSamples > 0:
+            segments.append(np.zeros(gapSamples, dtype=DTYPE))
+        segments.append(segment.astype(DTYPE, copy=False))
+
+    if not segments:
+        return np.zeros(_ms_to_samples(120, sampleRate), dtype=DTYPE)
+
+    combined = np.concatenate(segments).astype(DTYPE, copy=False)
+    return _normalize_peak(combined, PEAK_DEFAULT)
+
+
+def synth_tokens_to_wav(
+    tokens: Sequence[str],
+    outPath: str,
+    *,
+    f0: float = 120.0,
+    sampleRate: int = 22050,
+    vowelMilliseconds: int = 240,
+    overlapMilliseconds: int = 30,
+    gapMilliseconds: int = 40,
+    useOnsetTransition: bool = False,
+) -> str:
+    """トークン列合成 → WAV 保存。"""
+
+    waveform = synth_token_sequence(
+        tokens,
+        f0=f0,
+        sampleRate=sampleRate,
+        vowelMilliseconds=vowelMilliseconds,
+        overlapMilliseconds=overlapMilliseconds,
+        gapMilliseconds=gapMilliseconds,
+        useOnsetTransition=useOnsetTransition,
+    )
+    return write_wav(outPath, waveform, sampleRate=sampleRate)
 
 
 # =======================

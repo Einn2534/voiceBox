@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import threading
 from typing import Callable, Iterable, Sequence, Tuple
@@ -19,10 +20,19 @@ from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
 from kivy.uix.label import Label
 from kivy.uix.slider import Slider
+from kivy.uix.textinput import TextInput
 
 import numpy as np
 
-from Dsp import synth_cv, synth_cv_to_wav, synth_nasal, synth_phrase_to_wav, synth_vowel, write_wav
+from Dsp import (
+    synth_cv,
+    synth_cv_to_wav,
+    synth_nasal,
+    synth_phrase_to_wav,
+    synth_token_sequence,
+    synth_vowel,
+    write_wav,
+)
 
 FS = 22050  # サンプリング周波数（統一）
 
@@ -142,6 +152,21 @@ class Root(BoxLayout):
 
         for rowEntries in GOJUON_ROWS:
             self._add_gojuon_row(rowEntries)
+
+        phraseRow = BoxLayout(size_hint_y=None, height="48dp", spacing=8)
+        phraseRow.add_widget(Label(text="Phrase (romaji):", size_hint_x=None, width="140dp"))
+        self.customPhraseInput = TextInput(
+            hint_text="e.g. ka ki ku",
+            multiline=False,
+            size_hint_y=None,
+            height="40dp",
+        )
+        self.customPhraseInput.bind(on_text_validate=lambda *_: self.speak_custom_phrase())
+        phraseRow.add_widget(self.customPhraseInput)
+        phraseButton = Button(text="Speak")
+        phraseButton.bind(on_release=lambda *_: self.speak_custom_phrase())
+        phraseRow.add_widget(phraseButton)
+        self.add_widget(phraseRow)
 
         statusRow = BoxLayout(size_hint_y=None, height="48dp", spacing=8)
         sequenceButton = Button(text="Play A-I-U-E-O")
@@ -295,6 +320,36 @@ class Root(BoxLayout):
 
         self._play_async("sequence_aiueo.wav", build, "Played A-I-U-E-O")
 
+    def speak_custom_phrase(self) -> None:
+        """Synthesize an arbitrary romaji phrase typed by the user."""
+
+        tokens = self._tokenize_phrase(self.customPhraseInput.text)
+        if not tokens:
+            self._update_status("Enter romaji tokens, e.g. 'ka ki ku'")
+            return
+
+        label = " ".join(token.upper() for token in tokens)
+        self._update_status(f"Synth {label}...")
+        baseF0 = float(self.pitchSlider.value)
+        overlapMs = int(self.overlapSlider.value)
+        vowelMs = int(self.vowelDurationSlider.value)
+        useOnset = bool(self.onsetCheckBox.active)
+        gapMs = max(40, int(vowelMs * 0.25))
+
+        def build(tempPath: str) -> str:
+            waveform = synth_token_sequence(
+                tokens,
+                f0=baseF0,
+                sampleRate=FS,
+                vowelMilliseconds=vowelMs,
+                overlapMilliseconds=overlapMs,
+                gapMilliseconds=gapMs,
+                useOnsetTransition=useOnset,
+            )
+            return write_wav(tempPath, waveform, sampleRate=FS)
+
+        self._play_async("phrase_custom.wav", build, f"Played {label}")
+
     def _add_slider(
         self,
         *,
@@ -397,6 +452,12 @@ class Root(BoxLayout):
             rowLayout.add_widget(button)
 
         self.add_widget(rowLayout)
+
+    @staticmethod
+    def _tokenize_phrase(text: str) -> list[str]:
+        """Split a romaji phrase into synthesizable tokens."""
+
+        return [token for token in re.split(r"[^a-z]+", text.lower()) if token]
 
 
 class AppVocal(App):
