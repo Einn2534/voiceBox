@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import os
 import wave
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from math import pi, sin, cos, exp
+import unicodedata
 
 # =======================
 # Constants / Tables
@@ -75,11 +76,222 @@ NASAL_TOKEN_MAP: Dict[str, str] = {
     'm': 'm',
 }
 
+PAUSE_TOKEN = 'pau'
+
 DTYPE = np.float32
 PEAK_DEFAULT = 0.9
 
 # 乱数生成器を一元管理（毎回 new しない）
 RNG = np.random.default_rng()
+
+
+# =======================
+# Text helpers
+# =======================
+
+_VALID_TOKENS = set(CV_TOKEN_MAP) | set(VOWEL_TABLE) | set(NASAL_TOKEN_MAP)
+_MAX_ROMAJI_TOKEN_LENGTH = max(len(token) for token in _VALID_TOKENS)
+
+_KANA_BASE_MAP: Dict[str, List[str]] = {
+    'あ': ['a'], 'い': ['i'], 'う': ['u'], 'え': ['e'], 'お': ['o'],
+    'か': ['ka'], 'き': ['ki'], 'く': ['ku'], 'け': ['ke'], 'こ': ['ko'],
+    'さ': ['sa'], 'し': ['shi'], 'す': ['su'], 'せ': ['se'], 'そ': ['so'],
+    'た': ['ta'], 'ち': ['chi'], 'つ': ['tsu'], 'て': ['te'], 'と': ['to'],
+    'な': ['na'], 'に': ['ni'], 'ぬ': ['nu'], 'ね': ['ne'], 'の': ['no'],
+    'は': ['ha'], 'ひ': ['hi'], 'ふ': ['fu'], 'へ': ['he'], 'ほ': ['ho'],
+    'ま': ['ma'], 'み': ['mi'], 'む': ['mu'], 'め': ['me'], 'も': ['mo'],
+    'や': ['ya'], 'ゆ': ['yu'], 'よ': ['yo'],
+    'ら': ['ra'], 'り': ['ri'], 'る': ['ru'], 'れ': ['re'], 'ろ': ['ro'],
+    'わ': ['wa'], 'ゐ': ['i'], 'ゑ': ['e'], 'を': ['wo'],
+    'ん': ['n'],
+    'ぁ': ['a'], 'ぃ': ['i'], 'ぅ': ['u'], 'ぇ': ['e'], 'ぉ': ['o'],
+    'ゎ': ['wa'], 'ゕ': ['ka'], 'ゖ': ['ke'],
+    'ゔ': ['u'],
+}
+
+_VOICED_KANA_MAP: Dict[str, str] = {
+    'が': 'か', 'ぎ': 'き', 'ぐ': 'く', 'げ': 'け', 'ご': 'こ',
+    'ざ': 'さ', 'じ': 'し', 'ず': 'す', 'ぜ': 'せ', 'ぞ': 'そ',
+    'だ': 'た', 'ぢ': 'ち', 'づ': 'つ', 'で': 'て', 'ど': 'と',
+    'ば': 'は', 'び': 'ひ', 'ぶ': 'ふ', 'べ': 'へ', 'ぼ': 'ほ',
+}
+
+_HAND_DAKUTEN_MAP: Dict[str, str] = {
+    'ぱ': 'は', 'ぴ': 'ひ', 'ぷ': 'ふ', 'ぺ': 'へ', 'ぽ': 'ほ',
+}
+
+_KANA_DIGRAPH_MAP: Dict[str, List[str]] = {
+    'きゃ': ['ki', 'ya'], 'きゅ': ['ki', 'yu'], 'きょ': ['ki', 'yo'],
+    'ぎゃ': ['ki', 'ya'], 'ぎゅ': ['ki', 'yu'], 'ぎょ': ['ki', 'yo'],
+    'しゃ': ['shi', 'ya'], 'しゅ': ['shi', 'yu'], 'しょ': ['shi', 'yo'],
+    'じゃ': ['shi', 'ya'], 'じゅ': ['shi', 'yu'], 'じょ': ['shi', 'yo'],
+    'ちゃ': ['chi', 'ya'], 'ちゅ': ['chi', 'yu'], 'ちょ': ['chi', 'yo'],
+    'にゃ': ['ni', 'ya'], 'にゅ': ['ni', 'yu'], 'にょ': ['ni', 'yo'],
+    'ひゃ': ['hi', 'ya'], 'ひゅ': ['hi', 'yu'], 'ひょ': ['hi', 'yo'],
+    'びゃ': ['hi', 'ya'], 'びゅ': ['hi', 'yu'], 'びょ': ['hi', 'yo'],
+    'ぴゃ': ['hi', 'ya'], 'ぴゅ': ['hi', 'yu'], 'ぴょ': ['hi', 'yo'],
+    'みゃ': ['mi', 'ya'], 'みゅ': ['mi', 'yu'], 'みょ': ['mi', 'yo'],
+    'りゃ': ['ri', 'ya'], 'りゅ': ['ri', 'yu'], 'りょ': ['ri', 'yo'],
+}
+
+_PUNCTUATION_CHARS = set('、。，．,.!?！？；：:;…‥・「」『』（）()[]{}<>')
+_PUNCTUATION_CHARS.update({'"', "'", '“', '”', '‘', '’', '—'})
+
+
+def _normalize_to_hiragana(text: str) -> str:
+    """NFKC normalize and convert katakana to hiragana."""
+    normalized = unicodedata.normalize('NFKC', text)
+    buffer: List[str] = []
+    for char in normalized:
+        codePoint = ord(char)
+        if 0x30A1 <= codePoint <= 0x30F3:
+            buffer.append(chr(codePoint - 0x60))
+        elif char == 'ヴ':
+            buffer.append('ゔ')
+        elif char == 'ヵ':
+            buffer.append('ゕ')
+        elif char == 'ヶ':
+            buffer.append('ゖ')
+        else:
+            buffer.append(char)
+    return ''.join(buffer)
+
+
+def _append_pause(tokens: List[str]) -> None:
+    if tokens and tokens[-1] == PAUSE_TOKEN:
+        return
+    tokens.append(PAUSE_TOKEN)
+
+
+def _extend_last_vowel(tokens: List[str]) -> None:
+    for token in reversed(tokens):
+        if token == PAUSE_TOKEN:
+            continue
+        if token in VOWEL_TABLE:
+            tokens.append(token)
+            return
+        if token in CV_TOKEN_MAP:
+            tokens.append(CV_TOKEN_MAP[token][1])
+            return
+    # fallback: nothing to extend
+
+
+def _parse_romaji_sequence(sequence: str) -> List[str]:
+    tokens: List[str] = []
+    index = 0
+    length = len(sequence)
+    while index < length:
+        matched = False
+        maxLength = min(_MAX_ROMAJI_TOKEN_LENGTH, length - index)
+        for size in range(maxLength, 0, -1):
+            candidate = sequence[index:index + size]
+            if candidate in _VALID_TOKENS:
+                tokens.append(candidate)
+                index += size
+                matched = True
+                break
+        if matched:
+            continue
+        char = sequence[index]
+        if char in 'aiueo':
+            tokens.append(char)
+        elif char == 'n':
+            tokens.append('n')
+        index += 1
+    return tokens
+
+
+def text_to_tokens(text: str) -> List[str]:
+    """Convert arbitrary text to the synthesizer token sequence."""
+    if not text:
+        return []
+
+    tokens: List[str] = []
+    romajiBuffer: List[str] = []
+
+    normalized = _normalize_to_hiragana(text)
+    length = len(normalized)
+    position = 0
+
+    def flush_buffer() -> None:
+        nonlocal romajiBuffer
+        if romajiBuffer:
+            sequence = ''.join(romajiBuffer)
+            tokens.extend(_parse_romaji_sequence(sequence))
+            romajiBuffer = []
+
+    while position < length:
+        char = normalized[position]
+
+        if char.isascii() and char.isalpha():
+            romajiBuffer.append(char.lower())
+            position += 1
+            continue
+
+        flush_buffer()
+
+        if char.isspace() or char in _PUNCTUATION_CHARS:
+            _append_pause(tokens)
+            position += 1
+            continue
+
+        if char == 'ー':
+            _extend_last_vowel(tokens)
+            position += 1
+            continue
+
+        if char == 'っ':
+            _append_pause(tokens)
+            position += 1
+            continue
+
+        nextChar = normalized[position + 1] if position + 1 < length else ''
+        pair = char + nextChar
+        if pair in _KANA_DIGRAPH_MAP:
+            tokens.extend(_KANA_DIGRAPH_MAP[pair])
+            position += 2
+            continue
+
+        if char in _KANA_BASE_MAP:
+            tokens.extend(_KANA_BASE_MAP[char])
+            position += 1
+            continue
+
+        if char in _VOICED_KANA_MAP:
+            base = _VOICED_KANA_MAP[char]
+            tokens.extend(_KANA_BASE_MAP.get(base, []))
+            position += 1
+            continue
+
+        if char in _HAND_DAKUTEN_MAP:
+            base = _HAND_DAKUTEN_MAP[char]
+            tokens.extend(_KANA_BASE_MAP.get(base, []))
+            position += 1
+            continue
+
+        if char.isdigit():
+            _append_pause(tokens)
+            position += 1
+            continue
+
+        # unsupported symbol → skip
+        position += 1
+
+    flush_buffer()
+
+    # 圧縮: 連続ポーズをまとめて削除し先頭末尾のポーズを除く
+    compressed: List[str] = []
+    for token in tokens:
+        if token == PAUSE_TOKEN and (not compressed or compressed[-1] == PAUSE_TOKEN):
+            continue
+        compressed.append(token)
+
+    if compressed and compressed[0] == PAUSE_TOKEN:
+        compressed = compressed[1:]
+    if compressed and compressed[-1] == PAUSE_TOKEN:
+        compressed = compressed[:-1]
+
+    return compressed
 
 
 # =======================
@@ -750,6 +962,12 @@ def synth_token_sequence(
     for token in tokens:
         normalized = token.strip().lower()
         if not normalized:
+            continue
+
+        if normalized == PAUSE_TOKEN:
+            pauseMilliseconds = max(gapMilliseconds * 3, 120)
+            pauseSamples = _ms_to_samples(pauseMilliseconds, sampleRate)
+            segments.append(np.zeros(pauseSamples, dtype=DTYPE))
             continue
 
         if normalized in CV_TOKEN_MAP:

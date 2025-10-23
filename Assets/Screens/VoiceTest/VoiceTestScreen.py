@@ -22,6 +22,8 @@ import numpy as np  # 数値計算用ライブラリ 音声波形データの加
 
 import argparse     # コマンドライン引数の解析
 
+from Dsp import synth_token_sequence, text_to_tokens
+
 
 
 Builder.load_file('Assets/Screens/VoiceTest/VoiceTestScreen.kv')
@@ -50,6 +52,7 @@ CHANNELS = 1
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
+DSP_SAMPLE_RATE = 22050
 pya = pyaudio.PyAudio()
 
 
@@ -68,6 +71,7 @@ class VoiceTestScreen(Screen):
         self.running = False
         self.audio_in_queue = None
         self.out_queue = None
+        self._speech_lock = threading.Lock()
         # self.model = whisper.load_model("tiny", device="cuda" if torch.cuda.is_available() else "cpu")
 
     def on_enter(self):
@@ -164,7 +168,7 @@ class VoiceTestScreen(Screen):
 
                 if full_text:
                     # 最終的な全テキストも更新
-                    Clock.schedule_once(lambda dt, t=full_text: self.update_label(t))
+                    Clock.schedule_once(lambda dt, t=full_text: self.on_final_response(t))
 
         except Exception as e:
             print("receive_text error:", e)
@@ -173,12 +177,58 @@ class VoiceTestScreen(Screen):
     def update_label(self, text):
         """
         Update a Label on the UI thread
-        
+
         Keyword arguments:
         text -- Update label text
         """
-        
+
         if hasattr(self, "ids") and "apiResponse" in self.ids:
             self.ids.apiResponse.text = text
         else:
             print("⚠️ Label(apiResponse) が見つかりません")
+
+    def on_final_response(self, text):
+        """Handle the final Gemini response by updating the UI and speaking."""
+        self.update_label(text)
+        self.speak_text(text)
+
+    def speak_text(self, text):
+        """Convert text into DSP tokens and play the synthesized audio."""
+        if not text or not self.running:
+            return
+
+        def _playback_worker():
+            stream = None
+            with self._speech_lock:
+                try:
+                    tokens = text_to_tokens(text)
+                    if not tokens:
+                        print("speak_text: no speakable tokens")
+                        return
+
+                    waveform = synth_token_sequence(tokens, sampleRate=DSP_SAMPLE_RATE)
+                    audio = np.clip(waveform, -1.0, 1.0)
+                    audio_int16 = (audio * 32767.0).astype(np.int16)
+
+                    if not self.running:
+                        return
+
+                    stream = pya.open(
+                        format=FORMAT,
+                        channels=CHANNELS,
+                        rate=DSP_SAMPLE_RATE,
+                        output=True,
+                    )
+                    stream.write(audio_int16.tobytes())
+                except Exception as speak_error:
+                    print("speak_text error:", speak_error)
+                finally:
+                    if stream is not None:
+                        try:
+                            stream.stop_stream()
+                        except Exception:
+                            pass
+                        stream.close()
+
+        threading.Thread(target=_playback_worker, daemon=True).start()
+
