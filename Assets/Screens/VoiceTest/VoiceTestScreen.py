@@ -295,7 +295,7 @@ class VoiceTestScreen(Screen):
         stream = None
         try:
             tokens = text_to_tokens(text)
-            if not tokens:
+            if tokens is None or np.size(tokens) == 0:
                 print("speak_text: no speakable tokens")
                 return
 
