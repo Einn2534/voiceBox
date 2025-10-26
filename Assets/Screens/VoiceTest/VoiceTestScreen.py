@@ -294,25 +294,29 @@ class VoiceTestScreen(Screen):
 
         stream = None
         try:
-            tokens = text_to_tokens(text)
+            raw_tokens = text_to_tokens(text)
 
-            # ``text_to_tokens`` should normally return a Python ``list``.  However, be
-            # defensive here because any iterable (including a NumPy array) would be
-            # accepted by ``synth_token_sequence``.  NumPy arrays raise
-            # ``ValueError: The truth value of an array with more than one element is
-            # ambiguous`` when used in boolean contexts (e.g. ``if tokens``).  Convert
-            # such cases into a list explicitly so that our emptiness checks remain
-            # safe.
-            if isinstance(tokens, np.ndarray):
-                tokens = tokens.tolist()
-            elif tokens is None:
-                tokens = []
-            elif isinstance(tokens, str):
-                tokens = [tokens]
+            # ``text_to_tokens`` は Python の ``list`` を返す設計だが、将来的な変更や
+            # 例外的な入力に備え、ブーリアン評価が安全に行える通常の ``list`` へと
+            # 正規化しておく。NumPy 配列は ``if tokens`` などで真偽値評価すると
+            # ``ValueError`` を投げるため、一次元にフラット化したリストへ変換する。
+            if raw_tokens is None:
+                tokens: List[str] = []
+            elif isinstance(raw_tokens, np.ndarray):
+                tokens = raw_tokens.ravel().tolist()
+            elif isinstance(raw_tokens, list):
+                tokens = raw_tokens
+            elif isinstance(raw_tokens, tuple):
+                tokens = list(raw_tokens)
+            elif isinstance(raw_tokens, str):
+                tokens = [raw_tokens]
             else:
-                tokens = list(tokens)
+                try:
+                    tokens = list(raw_tokens)
+                except TypeError:
+                    tokens = [raw_tokens]
 
-            if len(tokens) == 0:
+            if not tokens:
                 print("speak_text: no speakable tokens")
                 return
 
