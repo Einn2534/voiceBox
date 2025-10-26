@@ -9,6 +9,10 @@ from kivy.clock import Clock    # Kivyのメインスレッドで安全にUI更�
 
 import asyncio      # 非同期処理
 import threading    # スレッド（軽量な並列実行）を扱う
+import queue
+import re
+import time
+from typing import Iterable, List, Optional
 
 from google import genai
 from google.genai import types
@@ -72,6 +76,9 @@ class VoiceTestScreen(Screen):
         self.audio_in_queue = None
         self.out_queue = None
         self._speech_lock = threading.Lock()
+        self._speech_queue: Optional[queue.Queue] = None
+        self._speech_worker: Optional[threading.Thread] = None
+        self._speech_stop_event: Optional[threading.Event] = None
         # self.model = whisper.load_model("tiny", device="cuda" if torch.cuda.is_available() else "cpu")
 
     def on_enter(self):
@@ -79,6 +86,7 @@ class VoiceTestScreen(Screen):
         
         print("VoiceTest Screen Entered!")
         self.ids.apiResponse.text = "Connecting..."
+        self._start_speech_worker()
 
         # 非同期ループを作成して別スレッドで起動
         self.loop = asyncio.new_event_loop()
@@ -93,6 +101,7 @@ class VoiceTestScreen(Screen):
         self.running = False
         if hasattr(self, "audio_stream") and self.audio_stream:
             self.audio_stream.close()
+        self._stop_speech_worker()
 
     async def run_audio_loop(self):
         """Gemini Live Connection Loop"""
@@ -190,44 +199,121 @@ class VoiceTestScreen(Screen):
     def on_final_response(self, text):
         """Handle the final Gemini response by updating the UI and speaking."""
         self.update_label(text)
-        self.speak_text(text)
+        self.enqueue_speech(text)
 
-    def speak_text(self, text):
-        """Convert text into DSP tokens and play the synthesized audio."""
+    def enqueue_speech(self, text: str) -> None:
+        """Enqueue text for sequential speech synthesis."""
+        if not text or not self.running:
+            return
+        self._start_speech_worker()
+        assert self._speech_queue is not None
+        self._speech_queue.put(text)
+
+    # -----------------------
+    # Speech helper routines
+    # -----------------------
+
+    def _start_speech_worker(self) -> None:
+        """Ensure that the speech worker thread is running."""
+        if self._speech_worker and self._speech_worker.is_alive():
+            return
+        self._speech_queue = queue.Queue()
+        self._speech_stop_event = threading.Event()
+        self._speech_worker = threading.Thread(target=self._speech_loop, daemon=True)
+        self._speech_worker.start()
+
+    def _stop_speech_worker(self) -> None:
+        """Stop the speech worker thread and drain the queue."""
+        if not self._speech_worker:
+            return
+        if self._speech_stop_event:
+            self._speech_stop_event.set()
+        if self._speech_queue is not None:
+            # Wake worker if it is waiting on queue.get()
+            try:
+                self._speech_queue.put_nowait(None)
+            except Exception:
+                pass
+        self._speech_worker.join(timeout=1.0)
+        self._speech_worker = None
+        self._speech_queue = None
+        self._speech_stop_event = None
+
+    def _speech_loop(self) -> None:
+        """Background worker consuming queued text and playing audio sequentially."""
+        assert self._speech_queue is not None
+        assert self._speech_stop_event is not None
+        while not self._speech_stop_event.is_set():
+            try:
+                item = self._speech_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                continue
+
+            for phrase in self._iterate_phrases(item):
+                if self._speech_stop_event.is_set() or not self.running:
+                    break
+                self._play_phrase(phrase)
+                time.sleep(0.12)
+
+    def _iterate_phrases(self, text: str) -> Iterable[str]:
+        """Split long text into manageable phrases for more fluent speech."""
+        normalized = re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
+        if not normalized:
+            return []
+
+        punctuation = set("。．.!?！？")
+        parts = re.split(r"([。．.!?！？])", normalized)
+        buffer = ""
+        phrases: List[str] = []
+        for part in parts:
+            if not part:
+                continue
+            buffer += part
+            if part in punctuation or len(buffer) >= 60:
+                phrase = buffer.strip()
+                if phrase:
+                    phrases.append(phrase)
+                buffer = ""
+        if buffer.strip():
+            phrases.append(buffer.strip())
+        return phrases
+
+    def _play_phrase(self, text: str) -> None:
+        """Convert a phrase to audio and play it synchronously."""
         if not text or not self.running:
             return
 
-        def _playback_worker():
-            stream = None
+        stream = None
+        try:
+            tokens = text_to_tokens(text)
+            if not tokens:
+                print("speak_text: no speakable tokens")
+                return
+
+            waveform = synth_token_sequence(tokens, sampleRate=DSP_SAMPLE_RATE)
+            audio = np.clip(waveform, -1.0, 1.0)
+            audio_int16 = (audio * 32767.0).astype(np.int16)
+
+            if not self.running:
+                return
+
             with self._speech_lock:
+                stream = pya.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=DSP_SAMPLE_RATE,
+                    output=True,
+                )
+                stream.write(audio_int16.tobytes())
+        except Exception as speak_error:
+            print("speak_text error:", speak_error)
+        finally:
+            if stream is not None:
                 try:
-                    tokens = text_to_tokens(text)
-                    if not tokens:
-                        print("speak_text: no speakable tokens")
-                        return
-
-                    waveform = synth_token_sequence(tokens, sampleRate=DSP_SAMPLE_RATE)
-                    audio = np.clip(waveform, -1.0, 1.0)
-                    audio_int16 = (audio * 32767.0).astype(np.int16)
-
-                    if not self.running:
-                        return
-
-                    stream = pya.open(
-                        format=FORMAT,
-                        channels=CHANNELS,
-                        rate=DSP_SAMPLE_RATE,
-                        output=True,
-                    )
-                    stream.write(audio_int16.tobytes())
-                except Exception as speak_error:
-                    print("speak_text error:", speak_error)
-                finally:
-                    if stream is not None:
-                        try:
-                            stream.stop_stream()
-                        except Exception:
-                            pass
-                        stream.close()
-
-        threading.Thread(target=_playback_worker, daemon=True).start()
+                    stream.stop_stream()
+                except Exception:
+                    pass
+                stream.close()
