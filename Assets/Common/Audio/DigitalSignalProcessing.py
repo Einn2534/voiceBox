@@ -822,7 +822,13 @@ def _apply_nasal_antiresonances(
     src = _ensure_array(src)
     if len(src) == 0:
         return src
-    if not zero_freqs or not zero_bws:
+    if zero_freqs is None or zero_bws is None:
+        return src
+
+    zero_freqs = np.asarray(zero_freqs).ravel()
+    zero_bws = np.asarray(zero_bws).ravel()
+
+    if zero_freqs.size == 0 or zero_bws.size == 0:
         return src
 
     depth = _clamp(depth, 0.0, 1.0)
