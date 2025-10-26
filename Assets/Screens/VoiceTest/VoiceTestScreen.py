@@ -293,6 +293,8 @@ class VoiceTestScreen(Screen):
             return
 
         stream = None
+        raw_tokens = None
+        tokens = None
         try:
             raw_tokens = text_to_tokens(text)
 
@@ -301,7 +303,7 @@ class VoiceTestScreen(Screen):
             # 正規化しておく。NumPy 配列は ``if tokens`` などで真偽値評価すると
             # ``ValueError`` を投げるため、一次元にフラット化したリストへ変換する。
             if raw_tokens is None:
-                tokens: List[str] = []
+                tokens = []
             elif isinstance(raw_tokens, np.ndarray):
                 tokens = raw_tokens.ravel().tolist()
             elif isinstance(raw_tokens, list):
@@ -315,6 +317,12 @@ class VoiceTestScreen(Screen):
                     tokens = list(raw_tokens)
                 except TypeError:
                     tokens = [raw_tokens]
+
+            if not isinstance(tokens, list):
+                try:
+                    tokens = list(tokens)
+                except TypeError:
+                    tokens = [tokens]
 
             if not tokens:
                 print("speak_text: no speakable tokens")
@@ -337,6 +345,32 @@ class VoiceTestScreen(Screen):
                 stream.write(audio_int16.tobytes())
         except Exception as speak_error:
             print("speak_text error:", speak_error)
+            if raw_tokens is not None:
+                try:
+                    print(
+                        "  raw_tokens type=",
+                        type(raw_tokens),
+                        "size=",
+                        getattr(raw_tokens, "shape", None),
+                        "repr=",
+                        repr(raw_tokens)[:200],
+                    )
+                except Exception:
+                    pass
+            if tokens is not None:
+                try:
+                    preview = tokens if isinstance(tokens, list) else list(tokens)
+                    print(
+                        "  normalized tokens type=",
+                        type(tokens),
+                        "len=",
+                        len(preview),
+                        "sample=",
+                        preview[:10],
+                    )
+                except Exception:
+                    pass
+            traceback.print_exc()
         finally:
             if stream is not None:
                 try:
