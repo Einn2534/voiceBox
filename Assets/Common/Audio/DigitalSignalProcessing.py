@@ -908,21 +908,33 @@ def synth_token_sequence(
     vowelMilliseconds: int = 240,
     overlapMilliseconds: int = 30,
     gapMilliseconds: int = 40,
+    tokenCrossfadeMilliseconds: int = 12,
     useOnsetTransition: bool = False,
 ) -> np.ndarray:
-    """ローマ字トークン列から波形を生成するヘルパー。"""
+    """ローマ字トークン列から波形を生成するヘルパー。
+
+    トークン同士の境界で小さなクロスフェードを行い、文字間のつながりを滑らかにする。
+    """
     segs: List[np.ndarray] = []
     gap = _ms_to_samples(max(0, int(gapMilliseconds)), sampleRate)
+    crossfade_ms = max(0, int(tokenCrossfadeMilliseconds))
     vow_sec = max(0.12, float(vowelMilliseconds) / 1000.0)
     nasal_ms = max(80, int(vowelMilliseconds * 0.6))
+
+    pending: Optional[np.ndarray] = None
+    prev_was_pause = True
 
     for tok in tokens:
         t = tok.strip().lower()
         if not t:
             continue
         if t == PAUSE_TOKEN:
+            if pending is not None:
+                segs.append(pending.astype(DTYPE, copy=False))
+                pending = None
             pause_ms = max(gapMilliseconds * 3, 120)
             segs.append(np.zeros(_ms_to_samples(pause_ms, sampleRate), dtype=DTYPE))
+            prev_was_pause = True
             continue
         if t in CV_TOKEN_MAP:
             ck, vk = CV_TOKEN_MAP[t]
@@ -937,9 +949,21 @@ def synth_token_sequence(
         else:
             raise ValueError(f"Unsupported token '{tok}' for synthesis")
 
-        if segs and gap > 0:
-            segs.append(np.zeros(gap, dtype=DTYPE))
-        segs.append(seg.astype(DTYPE, copy=False))
+        seg = seg.astype(DTYPE, copy=False)
+        if pending is None:
+            pending = seg
+        else:
+            if not prev_was_pause and crossfade_ms > 0 and gap == 0:
+                pending = _crossfade(pending, seg, sampleRate, overlap_ms=crossfade_ms)
+            else:
+                segs.append(pending)
+                if gap > 0:
+                    segs.append(np.zeros(gap, dtype=DTYPE))
+                pending = seg
+        prev_was_pause = False
+
+    if pending is not None:
+        segs.append(pending.astype(DTYPE, copy=False))
 
     if not segs:
         return np.zeros(_ms_to_samples(120, sampleRate), dtype=DTYPE)
@@ -957,6 +981,7 @@ def synth_tokens_to_wav(
     vowelMilliseconds: int = 240,
     overlapMilliseconds: int = 30,
     gapMilliseconds: int = 40,
+    tokenCrossfadeMilliseconds: int = 12,
     useOnsetTransition: bool = False,
 ) -> str:
     """トークン列合成 → WAV 保存。"""
@@ -967,6 +992,7 @@ def synth_tokens_to_wav(
         vowelMilliseconds=vowelMilliseconds,
         overlapMilliseconds=overlapMilliseconds,
         gapMilliseconds=gapMilliseconds,
+        tokenCrossfadeMilliseconds=tokenCrossfadeMilliseconds,
         useOnsetTransition=useOnsetTransition,
     )
     return write_wav(outPath, y, sampleRate=sampleRate)
