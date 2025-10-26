@@ -18,15 +18,15 @@ class GianApp(App):
     """The core of the app class"""
     
     title = 'GIAN'
-    icon  = './images/logo.png'
+    icon = 'Assets/Common/Images/logo.png'
 
     def build(self):
         """App build"""
-        screenManager = ControlScreenManager()
-        screenManager.add_widget(HomeScreen(name = 'home'))
-        screenManager.add_widget(ApiTestScreen(name = 'apiTest'))
-        screenManager.add_widget(VoiceTestScreen(name = 'voiceTest'))
-        return screenManager
+        screen_manager = ControlScreenManager()
+        screen_manager.add_widget(HomeScreen(name='home'))
+        screen_manager.add_widget(ApiTestScreen(name='apiTest'))
+        screen_manager.add_widget(VoiceTestScreen(name='voiceTest'))
+        return screen_manager
 
 if __name__ == '__main__':
     GianApp().run()
