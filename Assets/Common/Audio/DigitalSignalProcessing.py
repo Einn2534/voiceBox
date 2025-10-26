@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import wave
 import unicodedata
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -31,6 +32,28 @@ _NEUTRAL_TRACT_AREA_CM2 = np.array([
     2.4, 2.2, 1.9, 1.7, 1.5,
     1.3, 1.1, 0.95, 0.85, 0.8,
 ], dtype=np.float64)
+
+
+@dataclass(frozen=True)
+class NasalCoupling:
+    """Configuration parameters describing the nasal/sinus branching network."""
+
+    port_open: float = 1.0
+    vowel_leak: float = 0.0
+    nostril_area_cm2: float = 0.7
+    nasal_cavity_length_cm: float = 14.5
+    nasal_cavity_area_cm2: float = 2.4
+    sinus_cavity_length_cm: float = 5.5
+    sinus_cavity_area_cm2: float = 4.2
+    sinus_coupling_area_cm2: float = 0.5
+    loss_db_per_meter: float = 1.6
+
+
+@dataclass(frozen=True)
+class SpeakerProfile:
+    """Minimal speaker description used by the procedural voice model."""
+
+    nasal_coupling: NasalCoupling = field(default_factory=NasalCoupling)
 
 
 # =======================
@@ -114,6 +137,129 @@ _PUNCTUATION_CHARS.update({'"', "'", '“', '”', '‘', '’', '—'})
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
+
+
+def _clamp01(value: float) -> float:
+    return _clamp(float(value), 0.0, 1.0)
+
+
+def _sanitize_nasal_coupling(coupling: Optional[NasalCoupling]) -> NasalCoupling:
+    base = coupling or NasalCoupling()
+    return replace(
+        base,
+        port_open=_clamp01(base.port_open),
+        vowel_leak=_clamp01(base.vowel_leak),
+        nostril_area_cm2=max(0.1, float(base.nostril_area_cm2)),
+        nasal_cavity_length_cm=max(5.0, float(base.nasal_cavity_length_cm)),
+        nasal_cavity_area_cm2=max(0.5, float(base.nasal_cavity_area_cm2)),
+        sinus_cavity_length_cm=max(1.0, float(base.sinus_cavity_length_cm)),
+        sinus_cavity_area_cm2=max(0.1, float(base.sinus_cavity_area_cm2)),
+        sinus_coupling_area_cm2=max(0.05, float(base.sinus_coupling_area_cm2)),
+        loss_db_per_meter=max(0.0, float(base.loss_db_per_meter)),
+    )
+
+
+def _nasal_branch_zeros(
+    coupling: NasalCoupling,
+    sr: int,
+    *,
+    port_override: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    cfg = _sanitize_nasal_coupling(coupling)
+    if port_override is not None:
+        cfg = replace(cfg, port_open=_clamp01(port_override))
+    port = cfg.port_open
+    if sr <= 0 or port <= EPS:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+
+    eff_len = max(5.0, cfg.nasal_cavity_length_cm + 0.35 * cfg.nostril_area_cm2)
+    base_freq = SPEED_OF_SOUND_CM_S / (4.0 * eff_len)
+    area_ratio = cfg.nasal_cavity_area_cm2 / max(cfg.nostril_area_cm2, 0.1)
+    damping = cfg.loss_db_per_meter * 38.0
+
+    zeros: List[float] = []
+    bws: List[float] = []
+    for idx in range(3):
+        freq = base_freq * (2 * idx + 1)
+        if freq >= sr * 0.48:
+            break
+        q = max(1.8, area_ratio * (1.35 + 1.25 * port))
+        bw = freq / q + damping
+        zeros.append(freq)
+        bws.append(bw)
+
+    if cfg.sinus_coupling_area_cm2 > 0.05 and cfg.sinus_cavity_area_cm2 > 0.05:
+        eff_sinus_len = max(
+            1.0,
+            cfg.sinus_cavity_length_cm
+            + 0.18 * (cfg.sinus_cavity_area_cm2 / max(cfg.sinus_coupling_area_cm2, 0.05)),
+        )
+        sinus_freq = SPEED_OF_SOUND_CM_S / (4.0 * eff_sinus_len)
+        if sinus_freq < sr * 0.48:
+            q_s = max(
+                1.6,
+                (cfg.sinus_cavity_area_cm2 / max(cfg.sinus_coupling_area_cm2, 0.05))
+                * (1.05 + 0.6 * port),
+            )
+            bw_s = sinus_freq / q_s + damping * 0.8
+            zeros.append(sinus_freq)
+            bws.append(bw_s)
+
+    if not zeros:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+
+    zero_arr = np.asarray(zeros, dtype=np.float64)
+    bw_arr = np.asarray(bws, dtype=np.float64)
+    order = np.argsort(zero_arr)
+    return zero_arr[order], bw_arr[order]
+
+
+def _estimate_nasal_formants(
+    consonant: str,
+    coupling: NasalCoupling,
+    *,
+    port_override: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    cfg = _sanitize_nasal_coupling(coupling)
+    if port_override is not None:
+        cfg = replace(cfg, port_open=_clamp01(port_override))
+    port = cfg.port_open
+
+    nasal_len = max(6.0, cfg.nasal_cavity_length_cm + 0.6 * cfg.nostril_area_cm2)
+    base_freq = SPEED_OF_SOUND_CM_S / (4.0 * nasal_len)
+    scale = 1.4 + 1.1 * port + 0.03 * cfg.nostril_area_cm2
+    f1 = base_freq / scale
+    oral_front = 4.3 if consonant == 'n' else 5.6
+    oral_mid = 3.1 if consonant == 'n' else 3.9
+    scale2 = 2.0 + 0.8 * (1.0 - port) + 0.03 * cfg.nasal_cavity_area_cm2
+    scale3 = 2.05 + 0.6 * (1.0 - port) + 0.02 * (
+        cfg.nasal_cavity_area_cm2 + cfg.sinus_coupling_area_cm2
+    )
+    f2 = SPEED_OF_SOUND_CM_S / (2.0 * oral_front * scale2)
+    f3 = SPEED_OF_SOUND_CM_S / (2.0 * oral_mid * scale3)
+
+    if consonant == 'm':
+        f1 *= 0.92
+        f2 *= 0.88
+        scale_offset = 1.0 + 0.04 * cfg.nostril_area_cm2
+        f3 *= 0.94 / scale_offset
+
+    f1 = float(np.clip(f1, 150.0, 450.0))
+    f2 = float(np.clip(f2, 1100.0, 2300.0))
+    f3 = float(np.clip(f3, 2000.0, 3200.0))
+
+    loss_term = cfg.loss_db_per_meter * 22.0
+    bw1 = 70.0 + 130.0 * port + loss_term
+    bw2 = 150.0 + 120.0 * port + loss_term * 0.6
+    bw3 = 210.0 + 110.0 * port + loss_term * 0.5
+    if consonant == 'm':
+        bw1 += 12.0
+        bw2 += 8.0
+
+    return (
+        np.array([f1, f2, f3], dtype=np.float64),
+        np.array([bw1, bw2, bw3], dtype=np.float64),
+    )
 
 
 def _resample_profile(values: np.ndarray, size: int) -> np.ndarray:
@@ -513,6 +659,33 @@ def _bandpass_biquad_coeff(f0: float, Q: float, sr: int) -> Tuple[float, float, 
     return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
 
 
+def _notch_biquad_coeff(f0: float, bw: float, sr: int) -> Tuple[float, float, float, float, float]:
+    """Design a biquad notch filter centred at ``f0`` with bandwidth ``bw``."""
+
+    f0 = float(f0)
+    bw = float(max(bw, 1.0))
+    if sr <= 0:
+        return 1.0, 0.0, 0.0, 0.0, 0.0
+    theta = 2.0 * pi * f0 / sr
+    theta = float(np.clip(theta, 1e-4, np.pi - 1e-4))
+    r = float(np.exp(-pi * bw / sr))
+    r = float(_clamp(r, 0.0, 0.9995))
+    b0 = 1.0
+    b1 = -2.0 * cos(theta)
+    b2 = 1.0
+    a1 = -2.0 * r * cos(theta)
+    a2 = r * r
+
+    sum_b = b0 + b1 + b2
+    sum_a = 1.0 + a1 + a2
+    if abs(sum_b) > EPS:
+        gain = sum_a / sum_b
+        b0 *= gain
+        b1 *= gain
+        b2 *= gain
+    return b0, b1, b2, a1, a2
+
+
 def _biquad_process(x: np.ndarray, b0: float, b1: float, b2: float, a1: float, a2: float) -> np.ndarray:
     """単一Biquadフィルタ"""
     x = _ensure_array(x)
@@ -636,6 +809,41 @@ def _apply_formant_filters(src: np.ndarray, formants: Sequence[float], bws: Sequ
     return _lip_radiation(out)
 
 
+def _apply_nasal_antiresonances(
+    src: np.ndarray,
+    zero_freqs: Sequence[float],
+    zero_bws: Sequence[float],
+    sr: int,
+    *,
+    depth: float = 1.0,
+) -> np.ndarray:
+    """Apply notch filters that emulate nasal anti-resonances."""
+
+    src = _ensure_array(src)
+    if len(src) == 0:
+        return src
+    if not zero_freqs or not zero_bws:
+        return src
+
+    depth = _clamp(depth, 0.0, 1.0)
+    if depth <= EPS:
+        return src
+
+    filtered = src.copy()
+    for fz, bw in zip(zero_freqs, zero_bws):
+        if not np.isfinite(fz) or not np.isfinite(bw):
+            continue
+        if fz <= 0.0 or fz >= sr * 0.48:
+            continue
+        b0, b1, b2, a1, a2 = _notch_biquad_coeff(fz, bw, sr)
+        filtered = _biquad_process(filtered, b0, b1, b2, a1, a2)
+
+    if depth >= 1.0:
+        return filtered.astype(DTYPE, copy=False)
+    mixed = (1.0 - depth) * src + depth * filtered
+    return mixed.astype(DTYPE, copy=False)
+
+
 def _apply_all_pole_filter(src: np.ndarray, a_coeffs: np.ndarray) -> np.ndarray:
     """Apply an all-pole filter defined by ``a_coeffs`` (a[0] == 1)."""
 
@@ -698,6 +906,7 @@ def synth_vowel(
     useLegacyFormantFilter: bool = True,
     waveguideLipReflection: float = -0.85,
     waveguideWallLoss: float = 0.996,
+    speakerProfile: Optional[SpeakerProfile] = None,
 ) -> np.ndarray:
     """母音合成"""
     assert vowel in VOWEL_TABLE, f"unsupported vowel: {vowel}"
@@ -711,6 +920,19 @@ def synth_vowel(
     blend = _clamp(blend, 0.0, 1.0)
     formants = np.array(spec['F'], dtype=np.float64)
     bws = np.array(spec['BW'], dtype=np.float64)
+
+    nasal_zeros: Tuple[np.ndarray, np.ndarray] = (np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64))
+    nasal_leak_depth = 0.0
+    if speakerProfile is not None:
+        coupling = _sanitize_nasal_coupling(speakerProfile.nasal_coupling)
+        leak = coupling.vowel_leak
+        if leak > EPS:
+            base_port = coupling.port_open
+            effective_port = leak if base_port <= EPS else leak * base_port
+            zeros, zero_bw = _nasal_branch_zeros(coupling, sampleRate, port_override=effective_port)
+            if len(zeros) > 0:
+                nasal_zeros = (zeros, zero_bw)
+                nasal_leak_depth = _clamp(leak * (0.7 + 0.3 * base_port), 0.0, 1.0)
 
     k_sections = int(kellySections) if kellySections else len(_NEUTRAL_TRACT_AREA_CM2)
     profile_custom: Optional[np.ndarray] = None
@@ -776,6 +998,14 @@ def synth_vowel(
             applyRadiation=True,
         )
     y = _add_breath_noise(y, breathLevelDb)
+    if nasal_leak_depth > EPS and nasal_zeros[0].size > 0:
+        y = _apply_nasal_antiresonances(
+            y,
+            nasal_zeros[0],
+            nasal_zeros[1],
+            sampleRate,
+            depth=nasal_leak_depth,
+        )
     return _normalize_peak(y, PEAK_DEFAULT)
 
 
@@ -1087,7 +1317,13 @@ def synth_nasal(
     consonant: str = 'n',
     f0: float = 120.0,
     durationMilliseconds: float = 90.0,
-    sampleRate: int = 22050
+    sampleRate: int = 22050,
+    *,
+    nasalCoupling: Optional[NasalCoupling] = None,
+    speakerProfile: Optional[SpeakerProfile] = None,
+    portOpen: Optional[float] = None,
+    nostrilAreaCm2: Optional[float] = None,
+    breathLevelDb: float = -38.0,
 ) -> np.ndarray:
     """簡易的な鼻音 /n/, /m/"""
     c = consonant.lower()
@@ -1095,13 +1331,43 @@ def synth_nasal(
         raise ValueError("synth_nasal: supported nasals are 'n' or 'm'.")
 
     dur_s = max(20.0, float(durationMilliseconds)) / 1000.0
-    spec = NASAL_PRESETS[c]
-    y = _synth_vowel_fixed(spec['F'], spec['BW'], f0, dur_s, sampleRate,
-                           jitterCents=4.0, shimmerDb=0.4, breathLevelDb=-38.0)
-    y = _apply_fade(y, sampleRate,
-                    attack_ms=8.0 if c == 'n' else 10.0,
-                    release_ms=22.0 if c == 'n' else 28.0)
-    gain = 0.6 if c == 'n' else 0.7
+    coupling = nasalCoupling
+    if coupling is None and speakerProfile is not None:
+        coupling = speakerProfile.nasal_coupling
+    coupling = _sanitize_nasal_coupling(coupling)
+    if portOpen is not None:
+        coupling = replace(coupling, port_open=_clamp01(portOpen))
+    if nostrilAreaCm2 is not None:
+        coupling = replace(coupling, nostril_area_cm2=max(0.1, float(nostrilAreaCm2)))
+
+    formants, bws = _estimate_nasal_formants(c, coupling)
+    zeros, zero_bw = _nasal_branch_zeros(coupling, sampleRate)
+
+    breath_level = float(breathLevelDb)
+    breath_level += (1.0 - coupling.port_open) * 6.0
+    y = _synth_vowel_fixed(
+        formants,
+        bws,
+        f0,
+        dur_s,
+        sampleRate,
+        jitterCents=4.0,
+        shimmerDb=0.4,
+        breathLevelDb=breath_level,
+    )
+    depth = _clamp(0.75 + 0.2 * coupling.port_open, 0.0, 1.0)
+    if zeros.size > 0:
+        y = _apply_nasal_antiresonances(y, zeros, zero_bw, sampleRate, depth=depth)
+
+    y = _apply_fade(
+        y,
+        sampleRate,
+        attack_ms=8.0 if c == 'n' else 10.0,
+        release_ms=22.0 if c == 'n' else 28.0,
+    )
+    gain = 0.6 if c == 'n' else 0.68
+    gain += 0.06 * (coupling.port_open - 0.8)
+    gain = _clamp(gain, 0.45, 0.82)
     return _normalize_peak(y * gain, 0.5)
 
 
@@ -1116,6 +1382,7 @@ def synth_cv(
     overlapMilliseconds: int = 30,
     useOnsetTransition: bool = False,
     vowelModel: Optional[Dict[str, Any]] = None,
+    speakerProfile: Optional[SpeakerProfile] = None,
 ) -> np.ndarray:
     """子音 + 母音（50音相当までカバー）"""
     c = cons.lower()
@@ -1125,6 +1392,10 @@ def synth_cv(
 
     head = np.zeros(_ms_to_samples(preMilliseconds, sampleRate), dtype=DTYPE)
     vowel_kwargs = dict(vowelModel or {})
+    if speakerProfile is not None:
+        vowel_kwargs.setdefault('speakerProfile', speakerProfile)
+    speaker_profile: Optional[SpeakerProfile] = vowel_kwargs.get('speakerProfile')
+    nasal_coupling = speaker_profile.nasal_coupling if speaker_profile is not None else None
 
     if c in ('s', 'sh'):
         level = {'s': -14.0, 'sh': -15.0}[c]
@@ -1200,7 +1471,14 @@ def synth_cv(
 
     elif c == 'n':
         nasal_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 90.0
-        nasal = synth_nasal('n', f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate)
+        nasal = synth_nasal(
+            'n',
+            f0=f0,
+            durationMilliseconds=nasal_ms,
+            sampleRate=sampleRate,
+            nasalCoupling=nasal_coupling,
+            speakerProfile=speaker_profile,
+        )
         vow = synth_vowel(
             vowel=v,
             f0=f0,
@@ -1212,7 +1490,14 @@ def synth_cv(
 
     elif c == 'm':
         nasal_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 110.0
-        nasal = synth_nasal('m', f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate)
+        nasal = synth_nasal(
+            'm',
+            f0=f0,
+            durationMilliseconds=nasal_ms,
+            sampleRate=sampleRate,
+            nasalCoupling=nasal_coupling,
+            speakerProfile=speaker_profile,
+        )
         vow = synth_vowel(
             vowel=v,
             f0=f0,
@@ -1295,6 +1580,7 @@ def synth_cv_to_wav(
     overlapMilliseconds: int = 30,
     useOnsetTransition: bool = False,
     vowelModel: Optional[Dict[str, Any]] = None,
+    speakerProfile: Optional[SpeakerProfile] = None,
 ) -> str:
     """CV を合成して WAV 保存"""
     waveform = synth_cv(
@@ -1308,6 +1594,7 @@ def synth_cv_to_wav(
         overlapMilliseconds=overlapMilliseconds,
         useOnsetTransition=useOnsetTransition,
         vowelModel=vowelModel,
+        speakerProfile=speakerProfile,
     )
     return write_wav(outPath, waveform, sampleRate=sampleRate)
 
@@ -1320,10 +1607,13 @@ def synth_phrase_to_wav(
     gapMilliseconds: int = 30,
     sampleRate: int = 22050,
     vowelModel: Optional[Dict[str, Any]] = None,
+    speakerProfile: Optional[SpeakerProfile] = None,
 ) -> str:
     """MVP: 母音列 ['a','i',...] からフレーズ WAV を生成"""
     chunks: List[np.ndarray] = []
     vowel_kwargs = dict(vowelModel or {})
+    if speakerProfile is not None:
+        vowel_kwargs.setdefault('speakerProfile', speakerProfile)
 
     for v in map(str.lower, vowels):
         if v in VOWEL_TABLE:
@@ -1352,6 +1642,7 @@ def synth_token_sequence(
     gapMilliseconds: int = 40,
     useOnsetTransition: bool = False,
     vowelModel: Optional[Dict[str, Any]] = None,
+    speakerProfile: Optional[SpeakerProfile] = None,
 ) -> np.ndarray:
     """ローマ字トークン列から波形を生成するヘルパー。"""
     segs: List[np.ndarray] = []
@@ -1360,6 +1651,10 @@ def synth_token_sequence(
     nasal_ms = max(80, int(vowelMilliseconds * 0.6))
 
     vowel_kwargs = dict(vowelModel or {})
+    if speakerProfile is not None:
+        vowel_kwargs.setdefault('speakerProfile', speakerProfile)
+    speaker_profile: Optional[SpeakerProfile] = vowel_kwargs.get('speakerProfile')
+    nasal_coupling = speaker_profile.nasal_coupling if speaker_profile is not None else None
 
     for tok in tokens:
         t = tok.strip().lower()
@@ -1371,15 +1666,34 @@ def synth_token_sequence(
             continue
         if t in CV_TOKEN_MAP:
             ck, vk = CV_TOKEN_MAP[t]
-            seg = synth_cv(ck, vk, f0=f0, sampleRate=sampleRate,
-                           vowelMilliseconds=vowelMilliseconds,
-                           overlapMilliseconds=overlapMilliseconds,
-                           useOnsetTransition=useOnsetTransition,
-                           vowelModel=vowel_kwargs)
+            seg = synth_cv(
+                ck,
+                vk,
+                f0=f0,
+                sampleRate=sampleRate,
+                vowelMilliseconds=vowelMilliseconds,
+                overlapMilliseconds=overlapMilliseconds,
+                useOnsetTransition=useOnsetTransition,
+                vowelModel=vowel_kwargs,
+                speakerProfile=speaker_profile,
+            )
         elif t in VOWEL_TABLE:
-            seg = synth_vowel(t, f0=f0, durationSeconds=vow_sec, sampleRate=sampleRate, **vowel_kwargs)
+            seg = synth_vowel(
+                t,
+                f0=f0,
+                durationSeconds=vow_sec,
+                sampleRate=sampleRate,
+                **vowel_kwargs,
+            )
         elif t in NASAL_TOKEN_MAP:
-            seg = synth_nasal(NASAL_TOKEN_MAP[t], f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate)
+            seg = synth_nasal(
+                NASAL_TOKEN_MAP[t],
+                f0=f0,
+                durationMilliseconds=nasal_ms,
+                sampleRate=sampleRate,
+                nasalCoupling=nasal_coupling,
+                speakerProfile=speaker_profile,
+            )
         else:
             raise ValueError(f"Unsupported token '{tok}' for synthesis")
 
@@ -1405,6 +1719,7 @@ def synth_tokens_to_wav(
     gapMilliseconds: int = 40,
     useOnsetTransition: bool = False,
     vowelModel: Optional[Dict[str, Any]] = None,
+    speakerProfile: Optional[SpeakerProfile] = None,
 ) -> str:
     """トークン列合成 → WAV 保存。"""
     y = synth_token_sequence(
@@ -1416,6 +1731,7 @@ def synth_tokens_to_wav(
         gapMilliseconds=gapMilliseconds,
         useOnsetTransition=useOnsetTransition,
         vowelModel=vowelModel,
+        speakerProfile=speakerProfile,
     )
     return write_wav(outPath, y, sampleRate=sampleRate)
 
