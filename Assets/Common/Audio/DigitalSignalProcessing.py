@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import wave
 import unicodedata
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from math import pi, sin, cos, exp
@@ -20,6 +20,17 @@ from math import pi, sin, cos, exp
 DTYPE = np.float32
 PEAK_DEFAULT = 0.9
 EPS = 1e-12
+
+VOCAL_TRACT_LENGTH_CM = 17.5
+DEFAULT_TRACT_SECTIONS = 20
+SPEED_OF_SOUND_CM_S = 35000.0
+
+_NEUTRAL_TRACT_AREA_CM2 = np.array([
+    2.2, 2.3, 2.5, 2.8, 3.1,
+    3.4, 3.5, 3.3, 3.0, 2.7,
+    2.4, 2.2, 1.9, 1.7, 1.5,
+    1.3, 1.1, 0.95, 0.85, 0.8,
+], dtype=np.float64)
 
 
 # =======================
@@ -99,6 +110,149 @@ _PUNCTUATION_CHARS.update({'"', "'", '“', '”', '‘', '’', '—'})
 # =======================
 # Text helpers
 # =======================
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _resample_profile(values: np.ndarray, size: int) -> np.ndarray:
+    if len(values) == size:
+        return values.copy()
+    positions = np.linspace(0.0, len(values) - 1.0, num=len(values))
+    target = np.linspace(0.0, len(values) - 1.0, num=size)
+    return np.interp(target, positions, values).astype(np.float64)
+
+
+def generate_kelly_lochbaum_profile(
+    *,
+    numSections: int = DEFAULT_TRACT_SECTIONS,
+    articulation: Optional[Dict[str, float]] = None,
+    jaw: float = 0.0,
+    tongueBody: float = 0.0,
+    tongueTip: float = 0.0,
+    lipHeight: float = 0.0,
+    lipProtrusion: float = 0.0,
+    pharynx: float = 0.0,
+    smoothing: bool = True,
+) -> np.ndarray:
+    """Generate a Kelly-Lochbaum area profile from simplified articulation controls."""
+
+    params = {
+        'jaw': jaw,
+        'tongueBody': tongueBody,
+        'tongueTip': tongueTip,
+        'lipHeight': lipHeight,
+        'lipProtrusion': lipProtrusion,
+        'pharynx': pharynx,
+    }
+    if articulation:
+        params.update(articulation)
+
+    params = {k: _clamp(float(v), -1.0, 1.0) for k, v in params.items()}
+
+    base = _resample_profile(_NEUTRAL_TRACT_AREA_CM2, max(2, int(numSections)))
+    sections = len(base)
+    idx = np.arange(sections, dtype=np.float64)
+
+    areas = base.copy()
+
+    if params['jaw'] != 0.0:
+        areas *= np.exp(0.35 * params['jaw'])
+
+    if params['pharynx'] != 0.0:
+        weight = np.linspace(1.0, 0.2, sections)
+        areas *= np.exp(-0.6 * params['pharynx'] * weight)
+
+    if params['tongueBody'] != 0.0:
+        center = sections * (0.45 + 0.1 * params['tongueBody'])
+        width = max(1.5, 3.5 - params['tongueBody'] * 1.0)
+        bump = np.exp(-0.5 * ((idx - center) / width) ** 2)
+        areas *= 1.0 - 0.35 * params['tongueBody'] * bump
+
+    if params['tongueTip'] != 0.0:
+        center = sections * 0.72
+        width = 2.2
+        bump = np.exp(-0.5 * ((idx - center) / width) ** 2)
+        areas *= 1.0 - 0.25 * params['tongueTip'] * bump
+
+    if params['lipHeight'] != 0.0:
+        weights = np.clip((idx - (sections - 3)) / 3.0, 0.0, 1.0)
+        areas *= 1.0 - 0.5 * params['lipHeight'] * weights
+
+    if params['lipProtrusion'] != 0.0:
+        protrude = 1.0 - 0.4 * params['lipProtrusion']
+        areas[-3:] *= protrude
+
+    areas = np.clip(areas, 0.05, None)
+
+    if smoothing and sections > 2:
+        kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
+        padded = np.pad(areas, (1, 1), mode='edge')
+        areas = np.convolve(padded, kernel, mode='valid')
+
+    return areas.astype(np.float64, copy=False)
+
+
+def _reflection_to_lpc(reflection: Iterable[float]) -> np.ndarray:
+    a = np.array([1.0], dtype=np.float64)
+    for k in reflection:
+        k = float(_clamp(k, -0.999, 0.999))
+        m = len(a)
+        a_new = np.empty(m + 1, dtype=np.float64)
+        a_new[0] = 1.0
+        for i in range(1, m):
+            a_new[i] = a[i] + k * a[m - i]
+        a_new[m] = k
+        a = a_new
+    return a
+
+
+def area_profile_to_formants(
+    area_profile: Sequence[float],
+    *,
+    nFormants: int = 3,
+    lipReflection: float = -0.85,
+    wallLoss: float = 0.996,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Estimate formant frequencies/bandwidths from a Kelly-Lochbaum area profile."""
+
+    areas = np.asarray(area_profile, dtype=np.float64)
+    if areas.ndim != 1 or len(areas) < 2:
+        raise ValueError('area_profile must be a 1-D sequence with >=2 elements')
+
+    refl: List[float] = []
+    for left, right in zip(areas[:-1], areas[1:]):
+        denom = left + right
+        if denom <= EPS:
+            refl.append(0.0)
+        else:
+            refl.append((right - left) / denom)
+    refl.append(float(_clamp(lipReflection, -0.999, 0.0)))
+
+    a_poly = _reflection_to_lpc(refl)
+    roots = np.roots(a_poly)
+    roots = roots[np.abs(roots) > EPS]
+    roots = roots[np.imag(roots) >= 0.0]
+
+    section_len_cm = VOCAL_TRACT_LENGTH_CM / float(len(areas))
+    fs = SPEED_OF_SOUND_CM_S / (2.0 * section_len_cm)
+
+    freq = np.angle(roots) * fs / (2.0 * np.pi)
+    damp = np.abs(roots) * wallLoss
+    bw = -fs * np.log(np.clip(damp, EPS, 0.9999)) / np.pi
+
+    valid = np.isfinite(freq) & np.isfinite(bw) & (freq > 0.0) & (bw > 0.0)
+    freq = freq[valid]
+    bw = bw[valid]
+
+    if len(freq) == 0:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+
+    order = np.argsort(freq)
+    freq = freq[order][:nFormants]
+    bw = bw[order][:nFormants]
+    return freq.astype(np.float64), bw.astype(np.float64)
 
 def _normalize_to_hiragana(text: str) -> str:
     """NFKC normalize and convert katakana to hiragana."""
@@ -475,12 +629,55 @@ def synth_vowel(
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
+    *,
+    kellyBlend: Optional[float] = None,
+    articulation: Optional[Dict[str, float]] = None,
+    areaProfile: Optional[Sequence[float]] = None,
+    kellySections: Optional[int] = None,
 ) -> np.ndarray:
     """母音合成"""
     assert vowel in VOWEL_TABLE, f"unsupported vowel: {vowel}"
     src = _glottal_source(f0, durationSeconds, sampleRate, jitterCents, shimmerDb)
     spec = VOWEL_TABLE[vowel]
-    y = _apply_formant_filters(src, spec['F'], spec['BW'], sampleRate)
+
+    if kellyBlend is None:
+        blend = 1.0 if (articulation is not None or areaProfile is not None) else 0.0
+    else:
+        blend = float(kellyBlend)
+    blend = _clamp(blend, 0.0, 1.0)
+    formants = np.array(spec['F'], dtype=np.float64)
+    bws = np.array(spec['BW'], dtype=np.float64)
+
+    k_sections = int(kellySections) if kellySections else len(_NEUTRAL_TRACT_AREA_CM2)
+    new_formants: Optional[np.ndarray] = None
+    new_bw: Optional[np.ndarray] = None
+
+    if areaProfile is not None or articulation is not None or blend > 0.0:
+        if areaProfile is not None:
+            profile = np.asarray(areaProfile, dtype=np.float64)
+            if profile.ndim != 1:
+                raise ValueError('areaProfile must be one-dimensional')
+            if k_sections and len(profile) != k_sections:
+                profile = _resample_profile(profile.astype(np.float64), k_sections)
+        else:
+            profile = generate_kelly_lochbaum_profile(numSections=k_sections, articulation=articulation or {})
+        try:
+            new_formants, new_bw = area_profile_to_formants(profile, nFormants=len(formants))
+        except Exception:
+            new_formants, new_bw = None, None
+
+    if new_formants is not None and len(new_formants) > 0 and new_bw is not None:
+        if len(new_formants) < len(formants):
+            pad = len(formants) - len(new_formants)
+            new_formants = np.pad(new_formants, (0, pad), mode='edge')
+            new_bw = np.pad(new_bw, (0, pad), mode='edge')
+        elif len(new_formants) > len(formants):
+            new_formants = new_formants[:len(formants)]
+            new_bw = new_bw[:len(formants)]
+        formants = (1.0 - blend) * formants + blend * new_formants
+        bws = (1.0 - blend) * bws + blend * new_bw
+
+    y = _apply_formant_filters(src, formants, bws, sampleRate)
     y = _add_breath_noise(y, breathLevelDb)
     return _normalize_peak(y, PEAK_DEFAULT)
 
@@ -622,12 +819,21 @@ def synth_vowel_with_onset(
     onsetMilliseconds: int = 45,
     onsetFormants: Optional[Sequence[float]] = None,
     onsetBandwidthScale: float = 0.85,
+    vowelModel: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """母音先頭だけフォルマント遷移を与える簡易版"""
     spec = VOWEL_TABLE[vowel]
     targetF, targetBW = spec['F'], spec['BW']
+    vowel_kwargs = dict(vowelModel or {})
+
     if not onsetFormants:
-        return synth_vowel(vowel=vowel, f0=f0, durationSeconds=totalMilliseconds / 1000.0, sampleRate=sampleRate)
+        return synth_vowel(
+            vowel=vowel,
+            f0=f0,
+            durationSeconds=totalMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            **vowel_kwargs,
+        )
 
     total_ms = int(max(10, totalMilliseconds))
     onset_ms = int(max(1, min(onsetMilliseconds, total_ms - 1)))
@@ -643,7 +849,16 @@ def synth_vowel_with_onset(
     ov_ms = min(max(6.0, onset_ms * 0.45), 14.0, float(sustain_ms))
     rest_len_ms = sustain_ms + max(0.0, ov_ms)
 
-    sustain = _synth_vowel_fixed(targetF, targetBW, f0, rest_len_ms / 1000.0, sampleRate)
+    if vowel_kwargs:
+        sustain = synth_vowel(
+            vowel=vowel,
+            f0=f0,
+            durationSeconds=rest_len_ms / 1000.0,
+            sampleRate=sampleRate,
+            **vowel_kwargs,
+        )
+    else:
+        sustain = _synth_vowel_fixed(targetF, targetBW, f0, rest_len_ms / 1000.0, sampleRate)
     sustain = _apply_fade(sustain, sampleRate, attack_ms=4.0, release_ms=12.0)
 
     return _crossfade(onset, sustain, sampleRate, overlap_ms=ov_ms)
@@ -752,6 +967,7 @@ def synth_cv(
     vowelMilliseconds: int = 240,
     overlapMilliseconds: int = 30,
     useOnsetTransition: bool = False,
+    vowelModel: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """子音 + 母音（50音相当までカバー）"""
     c = cons.lower()
@@ -760,13 +976,20 @@ def synth_cv(
         raise ValueError("Unknown vowel for synth_cv")
 
     head = np.zeros(_ms_to_samples(preMilliseconds, sampleRate), dtype=DTYPE)
+    vowel_kwargs = dict(vowelModel or {})
 
     if c in ('s', 'sh'):
         level = {'s': -14.0, 'sh': -15.0}[c]
         default_ms = {'s': 160.0, 'sh': 150.0}[c]
         fric_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else default_ms
         fric = synth_fricative(c, durationSeconds=fric_ms / 1000.0, sampleRate=sampleRate, levelDb=level)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            **vowel_kwargs,
+        )
         out = _crossfade(fric, vow, sampleRate, overlap_ms=max(24, overlapMilliseconds))
 
     elif c in ('h', 'f'):
@@ -774,7 +997,13 @@ def synth_cv(
         cons_len = float(consonantMilliseconds) if consonantMilliseconds is not None else default_ms
         cons_len = max(0.0, cons_len)
         sil = np.zeros(_ms_to_samples(cons_len, sampleRate), dtype=DTYPE)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            **vowel_kwargs,
+        )
 
         req_ov = float(overlapMilliseconds) if consonantMilliseconds is not None else 12.0
         eff_ov = min(12.0, cons_len, max(0.0, req_ov))
@@ -785,10 +1014,23 @@ def synth_cv(
         plo = synth_plosive(c, sampleRate=sampleRate)
         if useOnsetTransition and v == 'a':
             onsetF = [800, 1800, 3000] if c == 't' else [800, 2200, 2400]
-            vow = synth_vowel_with_onset('a', f0, sampleRate, totalMilliseconds=vowelMilliseconds,
-                                         onsetMilliseconds=45, onsetFormants=onsetF)
+            vow = synth_vowel_with_onset(
+                'a',
+                f0,
+                sampleRate,
+                totalMilliseconds=vowelMilliseconds,
+                onsetMilliseconds=45,
+                onsetFormants=onsetF,
+                vowelModel=vowel_kwargs,
+            )
         else:
-            vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+            vow = synth_vowel(
+                vowel=v,
+                f0=f0,
+                durationSeconds=vowelMilliseconds / 1000.0,
+                sampleRate=sampleRate,
+                **vowel_kwargs,
+            )
 
         try:
             req = int(overlapMilliseconds)
@@ -799,27 +1041,53 @@ def synth_cv(
 
     elif c in ('ch', 'ts'):
         aff = synth_affricate(c, sampleRate=sampleRate)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            **vowel_kwargs,
+        )
         out = _crossfade(aff, vow, sampleRate, overlap_ms=max(12, min(overlapMilliseconds, 18)))
 
     elif c == 'n':
         nasal_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 90.0
         nasal = synth_nasal('n', f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            **vowel_kwargs,
+        )
         out = _crossfade(nasal, vow, sampleRate, overlap_ms=max(25, overlapMilliseconds))
 
     elif c == 'm':
         nasal_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 110.0
         nasal = synth_nasal('m', f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            **vowel_kwargs,
+        )
         out = _crossfade(nasal, vow, sampleRate, overlap_ms=max(28, overlapMilliseconds))
 
     elif c == 'w':
         onset_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 44.0
         onset_ms = max(24.0, min(onset_ms, float(vowelMilliseconds) - 8.0))
         onsetF = GLIDE_ONSETS['w'].get(v, GLIDE_ONSETS['w']['a'])
-        out = synth_vowel_with_onset(v, f0, sampleRate, totalMilliseconds=vowelMilliseconds,
-                                     onsetMilliseconds=int(onset_ms), onsetFormants=onsetF, onsetBandwidthScale=1.18)
+        out = synth_vowel_with_onset(
+            v,
+            f0,
+            sampleRate,
+            totalMilliseconds=vowelMilliseconds,
+            onsetMilliseconds=int(onset_ms),
+            onsetFormants=onsetF,
+            onsetBandwidthScale=1.18,
+            vowelModel=vowel_kwargs,
+        )
         out = _pre_emphasis(out, coefficient=0.86)
         out = _add_breath_noise(out, level_db=-36.0)
         out = _normalize_peak(out, PEAK_DEFAULT)
@@ -828,8 +1096,16 @@ def synth_cv(
         onset_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 40.0
         onset_ms = max(24.0, min(onset_ms, float(vowelMilliseconds) - 10.0))
         onsetF = GLIDE_ONSETS['y'].get(v, GLIDE_ONSETS['y']['a'])
-        out = synth_vowel_with_onset(v, f0, sampleRate, totalMilliseconds=vowelMilliseconds,
-                                     onsetMilliseconds=int(onset_ms), onsetFormants=onsetF, onsetBandwidthScale=1.10)
+        out = synth_vowel_with_onset(
+            v,
+            f0,
+            sampleRate,
+            totalMilliseconds=vowelMilliseconds,
+            onsetMilliseconds=int(onset_ms),
+            onsetFormants=onsetF,
+            onsetBandwidthScale=1.10,
+            vowelModel=vowel_kwargs,
+        )
         out = _pre_emphasis(out, coefficient=0.84)
         out = _add_breath_noise(out, level_db=-38.0)
         out = _normalize_peak(out, PEAK_DEFAULT)
@@ -838,8 +1114,15 @@ def synth_cv(
         tap = synth_plosive('t', sampleRate=sampleRate, closureMilliseconds=12.0, burstMilliseconds=6.0,
                             aspirationMilliseconds=4.0, levelDb=-20.0)
         onsetF = LIQUID_ONSETS.get(v, LIQUID_ONSETS['a'])
-        vow = synth_vowel_with_onset(v, f0, sampleRate, totalMilliseconds=vowelMilliseconds,
-                                     onsetMilliseconds=36, onsetFormants=onsetF)
+        vow = synth_vowel_with_onset(
+            v,
+            f0,
+            sampleRate,
+            totalMilliseconds=vowelMilliseconds,
+            onsetMilliseconds=36,
+            onsetFormants=onsetF,
+            vowelModel=vowel_kwargs,
+        )
         out = _crossfade(tap, vow, sampleRate, overlap_ms=12)
 
     else:
@@ -863,6 +1146,7 @@ def synth_cv_to_wav(
     vowelMilliseconds: int = 240,
     overlapMilliseconds: int = 30,
     useOnsetTransition: bool = False,
+    vowelModel: Optional[Dict[str, Any]] = None,
 ) -> str:
     """CV を合成して WAV 保存"""
     waveform = synth_cv(
@@ -875,6 +1159,7 @@ def synth_cv_to_wav(
         vowelMilliseconds=vowelMilliseconds,
         overlapMilliseconds=overlapMilliseconds,
         useOnsetTransition=useOnsetTransition,
+        vowelModel=vowelModel,
     )
     return write_wav(outPath, waveform, sampleRate=sampleRate)
 
@@ -886,12 +1171,21 @@ def synth_phrase_to_wav(
     unitMilliseconds: int = 220,
     gapMilliseconds: int = 30,
     sampleRate: int = 22050,
+    vowelModel: Optional[Dict[str, Any]] = None,
 ) -> str:
     """MVP: 母音列 ['a','i',...] からフレーズ WAV を生成"""
     chunks: List[np.ndarray] = []
+    vowel_kwargs = dict(vowelModel or {})
+
     for v in map(str.lower, vowels):
         if v in VOWEL_TABLE:
-            seg = synth_vowel(v, f0=f0, durationSeconds=unitMilliseconds / 1000.0, sampleRate=sampleRate)
+            seg = synth_vowel(
+                v,
+                f0=f0,
+                durationSeconds=unitMilliseconds / 1000.0,
+                sampleRate=sampleRate,
+                **vowel_kwargs,
+            )
             chunks.append(seg)
             chunks.append(np.zeros(_ms_to_samples(gapMilliseconds, sampleRate), dtype=DTYPE))
     if not chunks:
@@ -909,12 +1203,15 @@ def synth_token_sequence(
     overlapMilliseconds: int = 30,
     gapMilliseconds: int = 40,
     useOnsetTransition: bool = False,
+    vowelModel: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """ローマ字トークン列から波形を生成するヘルパー。"""
     segs: List[np.ndarray] = []
     gap = _ms_to_samples(max(0, int(gapMilliseconds)), sampleRate)
     vow_sec = max(0.12, float(vowelMilliseconds) / 1000.0)
     nasal_ms = max(80, int(vowelMilliseconds * 0.6))
+
+    vowel_kwargs = dict(vowelModel or {})
 
     for tok in tokens:
         t = tok.strip().lower()
@@ -929,9 +1226,10 @@ def synth_token_sequence(
             seg = synth_cv(ck, vk, f0=f0, sampleRate=sampleRate,
                            vowelMilliseconds=vowelMilliseconds,
                            overlapMilliseconds=overlapMilliseconds,
-                           useOnsetTransition=useOnsetTransition)
+                           useOnsetTransition=useOnsetTransition,
+                           vowelModel=vowel_kwargs)
         elif t in VOWEL_TABLE:
-            seg = synth_vowel(t, f0=f0, durationSeconds=vow_sec, sampleRate=sampleRate)
+            seg = synth_vowel(t, f0=f0, durationSeconds=vow_sec, sampleRate=sampleRate, **vowel_kwargs)
         elif t in NASAL_TOKEN_MAP:
             seg = synth_nasal(NASAL_TOKEN_MAP[t], f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate)
         else:
@@ -958,6 +1256,7 @@ def synth_tokens_to_wav(
     overlapMilliseconds: int = 30,
     gapMilliseconds: int = 40,
     useOnsetTransition: bool = False,
+    vowelModel: Optional[Dict[str, Any]] = None,
 ) -> str:
     """トークン列合成 → WAV 保存。"""
     y = synth_token_sequence(
@@ -968,6 +1267,7 @@ def synth_tokens_to_wav(
         overlapMilliseconds=overlapMilliseconds,
         gapMilliseconds=gapMilliseconds,
         useOnsetTransition=useOnsetTransition,
+        vowelModel=vowelModel,
     )
     return write_wav(outPath, y, sampleRate=sampleRate)
 
