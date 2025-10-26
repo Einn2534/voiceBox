@@ -9,13 +9,18 @@
         Label:
             id: apiResponse
             text: "VoiceTestScreen"
+            font_name: 'DotGothic16'
         BoxLayout:
             TextInput:
                 id: apiRequest
                 hint_text: 'apiRequest'
+                font_name: 'DotGothic16'
             Button:
                 text: "Enter"
+                font_name: 'DotGothic16'
                 on_press: root.send_text()
         Button:
             text: "Top"
+            font_name: 'DotGothic16'
             on_press: app.root.current = 'home'
+

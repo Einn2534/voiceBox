@@ -5,6 +5,7 @@
 
 from kivy.uix.screenmanager import Screen
 from kivy.lang import Builder
+from kivy.core.text import LabelBase
 from kivy.clock import Clock    # Kivyのメインスレッドで安全にUI更新を行うためのタイマー管理。非同期処理の中で画面を更新するときに必須。
 
 import asyncio      # 非同期処理
@@ -29,6 +30,11 @@ import argparse     # コマンドライン引数の解析
 from Assets.Common.Audio.DigitalSignalProcessing import text_to_tokens, synth_token_sequence
 
 
+
+LabelBase.register(
+    name="DotGothic16",
+    fn_regular="Assets/Common/Font/DotGothic16-Regular.ttf",
+)
 
 Builder.load_file('Assets/Screens/VoiceTest/VoiceTestScreen.kv')
 
