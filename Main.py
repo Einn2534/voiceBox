@@ -4,11 +4,20 @@
 # 
 
 from kivy.app import App
+from kivy.core.text import LabelBase
+from kivy.resources import resource_add_path
 from kivy.uix.screenmanager import ScreenManager
 
 from Assets.Screens.Home.HomeScreen import HomeScreen
 from Assets.Screens.ApiTest.ApiTestScreen import ApiTestScreen
 from Assets.Screens.VoiceTest.VoiceTestScreen import VoiceTestScreen
+
+
+resource_add_path("Assets/Common/Font")
+LabelBase.register(
+    name="DotGothic16",
+    fn_regular="Assets/Common/Font/DotGothic16-Regular.ttf",
+)
 
 class ControlScreenManager(ScreenManager):
     """Screen management class"""
@@ -16,9 +25,10 @@ class ControlScreenManager(ScreenManager):
 
 class GianApp(App):
     """The core of the app class"""
-    
+
     title = 'GIAN'
-    icon  = './images/logo.png'
+    icon  = 'Assets/Common/Images/logo.png'
+    font_name = "DotGothic16"
 
     def build(self):
         """App build"""

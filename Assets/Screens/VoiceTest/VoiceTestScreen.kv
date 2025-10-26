@@ -20,6 +20,7 @@
             text_size: self.width, None
             halign: 'left'
             valign: 'middle'
+            font_name: app.font_name
 
         ScrollView:
             size_hint_y: 0.55
@@ -32,6 +33,7 @@
                 height: self.texture_size[1]
                 halign: 'left'
                 valign: 'top'
+                font_name: app.font_name
 
         TextInput:
             id: apiRequest
@@ -39,6 +41,7 @@
             multiline: True
             size_hint_y: None
             height: dp(100)
+            font_name: app.font_name
 
         BoxLayout:
             size_hint_y: None
@@ -47,12 +50,15 @@
             Button:
                 text: "録音開始"
                 on_press: root.start_recording()
+                font_name: app.font_name
             Button:
                 text: "停止して文字起こし"
                 on_press: root.stop_and_transcribe()
+                font_name: app.font_name
             Button:
                 text: "取消"
                 on_press: root.cancel_recording()
+                font_name: app.font_name
 
         BoxLayout:
             size_hint_y: None
@@ -61,9 +67,12 @@
             Button:
                 text: "テキストをコピー"
                 on_press: root.copy_to_clipboard()
+                font_name: app.font_name
             Button:
                 text: "クリア"
                 on_press: root.clear_transcript()
+                font_name: app.font_name
             Button:
                 text: "Top"
                 on_press: app.root.current = 'home'
+                font_name: app.font_name

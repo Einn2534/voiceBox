@@ -8,11 +8,14 @@
         orientation: 'vertical'
         Label:
             text: "HomeScreen"
+            font_name: app.font_name
 
         BoxLayout:
             Button:
                 text: "Api"
                 on_press: app.root.current = 'apiTest'
+                font_name: app.font_name
             Button:
                 text: "Voice"
                 on_press: app.root.current = 'voiceTest'
+                font_name: app.font_name

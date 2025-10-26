@@ -9,13 +9,17 @@
         Label:
             id: apiResponse
             text: "ApiTestScreen"
+            font_name: app.font_name
         BoxLayout:
             TextInput:
                 id: apiRequest
                 hint_text: 'apiRequest'
+                font_name: app.font_name
             Button:
                 text: "Enter"
                 on_press: root.send_text()
+                font_name: app.font_name
         Button:
             text: "Top"
             on_press: app.root.current = 'home'
+            font_name: app.font_name
