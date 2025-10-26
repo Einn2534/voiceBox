@@ -295,7 +295,24 @@ class VoiceTestScreen(Screen):
         stream = None
         try:
             tokens = text_to_tokens(text)
-            if tokens is None or np.size(tokens) == 0:
+
+            # ``text_to_tokens`` should normally return a Python ``list``.  However, be
+            # defensive here because any iterable (including a NumPy array) would be
+            # accepted by ``synth_token_sequence``.  NumPy arrays raise
+            # ``ValueError: The truth value of an array with more than one element is
+            # ambiguous`` when used in boolean contexts (e.g. ``if tokens``).  Convert
+            # such cases into a list explicitly so that our emptiness checks remain
+            # safe.
+            if isinstance(tokens, np.ndarray):
+                tokens = tokens.tolist()
+            elif tokens is None:
+                tokens = []
+            elif isinstance(tokens, str):
+                tokens = [tokens]
+            else:
+                tokens = list(tokens)
+
+            if len(tokens) == 0:
                 print("speak_text: no speakable tokens")
                 return
 
