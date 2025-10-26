@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import wave
 import unicodedata
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -22,6 +23,48 @@ PEAK_DEFAULT = 0.9
 EPS = 1e-12
 
 
+@dataclass(frozen=True)
+class SpeakerProfile:
+    """Simple articulation-aware speaker description.
+
+    Attributes:
+        tract_length_cm: Approximate vocal tract length. Smaller values raise
+            all formants while larger values lower them.
+        nasal_coupling: 0.0-1.0 amount of nasal coupling. Higher values widen
+            the first formant and slightly reduce its center frequency.
+        brightness: -1.0-1.0 tilt applied to upper formants to mimic darker or
+            brighter timbre preferences.
+    """
+
+    tract_length_cm: float = 17.5
+    nasal_coupling: float = 0.0
+    brightness: float = 0.0
+
+    @property
+    def formant_scale(self) -> float:
+        base = 17.5
+        length = max(12.0, min(22.0, float(self.tract_length_cm)))
+        return base / length
+
+
+@dataclass(frozen=True)
+class GlottalModelParams:
+    """Controls for the quasi-physical glottal source."""
+
+    model: str = "rosenberg"
+    open_quotient: float = 0.58
+    return_phase: float = 0.16
+    speed_quotient: float = 1.15
+    tenseness: float = 0.6
+    breathiness_db: float = -48.0
+    aspiration_db: float = -42.0
+    noise_seed: Optional[int] = None
+
+
+DEFAULT_SPEAKER = SpeakerProfile()
+DEFAULT_GLOTTAL = GlottalModelParams()
+
+
 # =======================
 # Vowel / Token Tables
 # =======================
@@ -33,6 +76,15 @@ VOWEL_TABLE: Dict[str, Dict[str, Sequence[float]]] = {
     'u': {'F': [325, 700, 2530],  'BW': [60, 90, 140]},
     'e': {'F': [400, 1700, 2600], 'BW': [70, 100, 150]},
     'o': {'F': [450, 800, 2830],  'BW': [80, 110, 150]},
+}
+
+# ---- Articulatory descriptors (0.0-1.0 scales) ----
+ARTICULATION_PRESETS: Dict[str, Dict[str, float]] = {
+    'a': {'height': 0.18, 'backness': 0.82, 'rounding': 0.15, 'jaw': 0.92, 'tenseness': 0.42},
+    'i': {'height': 0.94, 'backness': 0.12, 'rounding': 0.05, 'jaw': 0.28, 'tenseness': 0.78},
+    'u': {'height': 0.58, 'backness': 0.67, 'rounding': 0.82, 'jaw': 0.42, 'tenseness': 0.64},
+    'e': {'height': 0.70, 'backness': 0.38, 'rounding': 0.10, 'jaw': 0.44, 'tenseness': 0.66},
+    'o': {'height': 0.36, 'backness': 0.77, 'rounding': 0.74, 'jaw': 0.55, 'tenseness': 0.55},
 }
 
 # ローマ字トークン → (子音, 母音)
@@ -95,6 +147,107 @@ _KANA_DIGRAPH_MAP: Dict[str, List[str]] = {
 
 _PUNCTUATION_CHARS = set('、。，．,.!?！？；：:;…‥・「」『』（）()[]{}<>')
 _PUNCTUATION_CHARS.update({'"', "'", '“', '”', '‘', '’', '—'})
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _articulation_to_formants(
+    vowel: str,
+    speaker: Optional[SpeakerProfile] = None,
+) -> Tuple[List[float], List[float]]:
+    """Estimate formant/bandwidth pairs from articulatory descriptors."""
+
+    spk = speaker or DEFAULT_SPEAKER
+    preset = ARTICULATION_PRESETS.get(vowel)
+    if preset is None:
+        spec = VOWEL_TABLE[vowel]
+        formants = [float(f) * spk.formant_scale for f in spec['F']]
+        bws = list(map(float, spec['BW']))
+        return formants, bws
+
+    height = _clamp(float(preset.get('height', 0.6)), 0.0, 1.0)
+    backness = _clamp(float(preset.get('backness', 0.5)), 0.0, 1.0)
+    rounding = _clamp(float(preset.get('rounding', 0.2)), 0.0, 1.0)
+    jaw = _clamp(float(preset.get('jaw', 0.4)), 0.0, 1.0)
+    tenseness = _clamp(float(preset.get('tenseness', 0.6)), 0.0, 1.0)
+    brightness = _clamp(float(spk.brightness), -1.0, 1.0)
+    nasal = _clamp(float(spk.nasal_coupling), 0.0, 1.0)
+
+    inv_height = 1.0 - height
+    frontness = 1.0 - backness
+
+    f1 = 290.0 + 780.0 * inv_height + 280.0 * jaw
+    f2 = 900.0 + 1350.0 * frontness - 320.0 * rounding + 140.0 * (tenseness - 0.5)
+    f3 = 2550.0 + 160.0 * frontness - 420.0 * rounding + 210.0 * brightness
+    f4 = 3700.0 + 320.0 * tenseness - 260.0 * rounding + 240.0 * brightness
+
+    scale = spk.formant_scale
+    formants = [f1 * scale, f2 * scale, f3 * scale, f4 * scale]
+
+    # Maintain monotonically increasing centers
+    for idx in range(1, len(formants)):
+        if formants[idx] <= formants[idx - 1] + 50.0:
+            formants[idx] = formants[idx - 1] + 50.0
+
+    bw_base = [60.0, 90.0, 150.0, 220.0]
+    spread = 1.0 + 0.55 * (1.0 - tenseness)
+    bws = [bw * spread for bw in bw_base]
+    bws[0] *= 1.0 + 0.32 * jaw
+    bws[1] *= 1.0 + 0.26 * rounding
+    bws[2] *= 1.0 + 0.18 * abs(brightness)
+    bws[3] *= 1.0 + 0.26 * abs(brightness)
+
+    if nasal > 0.0:
+        formants[0] *= 1.0 - 0.08 * nasal
+        bws[0] *= 1.0 + 0.55 * nasal
+        bws[1] *= 1.0 + 0.24 * nasal
+
+    return [float(f) for f in formants], [float(max(30.0, bw)) for bw in bws]
+
+
+def _blend_formant_specs(
+    base_formants: Sequence[float],
+    base_bandwidths: Sequence[float],
+    art_formants: Sequence[float],
+    art_bandwidths: Sequence[float],
+    mix: float,
+) -> Tuple[List[float], List[float]]:
+    mix = _clamp(float(mix), 0.0, 1.0)
+    n = max(len(base_formants), len(art_formants))
+    out_f: List[float] = []
+    out_bw: List[float] = []
+
+    def _extend(seq: Sequence[float], idx: int) -> float:
+        if idx < len(seq):
+            return float(seq[idx])
+        if not seq:
+            return 0.0
+        step = max(1.0, float(seq[-1]) * 0.15)
+        return float(seq[-1]) + step * (idx - len(seq) + 1)
+
+    for i in range(n):
+        bf = _extend(base_formants, i)
+        af = _extend(art_formants, i)
+        out_f.append(bf * (1.0 - mix) + af * mix)
+
+        bb = _extend(base_bandwidths, i)
+        ab = _extend(art_bandwidths, i)
+        out_bw.append(bb * (1.0 - mix) + ab * mix)
+
+    return out_f, out_bw
+
+
+def _scale_formants_for_speaker(
+    formants: Sequence[float],
+    speaker: Optional[SpeakerProfile],
+) -> List[float]:
+    if speaker is None:
+        return [float(f) for f in formants]
+    scale = speaker.formant_scale
+    return [float(f) * scale for f in formants]
+
 
 # =======================
 # Text helpers
@@ -386,20 +539,114 @@ def _lip_radiation(x: np.ndarray) -> np.ndarray:
 # Sources / Noise
 # =======================
 
+def _rosenberg_glottal_source(
+    f0: float,
+    dur_s: float,
+    sr: int,
+    jitter_cents: float,
+    shimmer_db: float,
+    params: GlottalModelParams,
+) -> np.ndarray:
+    rng = np.random.default_rng(params.noise_seed)
+    n = max(0, int(dur_s * sr))
+    if n == 0:
+        return np.zeros(0, dtype=DTYPE)
+
+    pole = 0.997
+
+    jn = rng.standard_normal(n).astype(DTYPE)
+    js = np.empty_like(jn)
+    acc = 0.0
+    for i, val in enumerate(jn):
+        acc = pole * acc + (1.0 - pole) * val
+        js[i] = acc
+    cents = (jitter_cents / 100.0) * js
+    inst_f = np.maximum(40.0, f0 * (2.0 ** (cents / 12.0))).astype(np.float64)
+
+    sn = rng.standard_normal(n).astype(DTYPE)
+    ss = np.empty_like(sn)
+    acc = 0.0
+    for i, val in enumerate(sn):
+        acc = pole * acc + (1.0 - pole) * val
+        ss[i] = acc
+    amp_env = (_db_to_lin(shimmer_db) ** ss).astype(np.float64)
+
+    open_ratio = _clamp(params.open_quotient, 0.3, 0.95)
+    return_ratio = _clamp(params.return_phase, 0.05, 0.4)
+    total = open_ratio + return_ratio
+    if total > 0.98:
+        scale = 0.98 / total
+        open_ratio *= scale
+        return_ratio *= scale
+
+    speed = _clamp(params.speed_quotient, 0.4, 2.5)
+    tenseness = _clamp(params.tenseness, 0.0, 1.0)
+
+    samples = np.empty(n, dtype=np.float64)
+    phase = 0.0
+    dc = 0.0
+    dc_coeff = 0.995
+
+    breath_gain = _db_to_lin(params.breathiness_db) if params.breathiness_db < 0.0 else 0.0
+    aspiration_gain = _db_to_lin(params.aspiration_db) if params.aspiration_db < 0.0 else 0.0
+    breath_noise = rng.standard_normal(n).astype(DTYPE) if breath_gain > 0.0 else None
+    aspiration_noise = rng.standard_normal(n).astype(DTYPE) if aspiration_gain > 0.0 else None
+
+    for i in range(n):
+        freq = inst_f[i]
+        phase += freq / sr
+        if phase >= 1.0:
+            phase -= int(phase)
+
+        t = phase
+        if t < open_ratio:
+            rel = (t / open_ratio) ** (1.0 / speed)
+            sample = 0.5 * (1.0 - cos(pi * rel))
+        elif t < open_ratio + return_ratio:
+            rel = (t - open_ratio) / return_ratio
+            rel = rel ** speed
+            sample = cos((pi * rel) / 2.0)
+        else:
+            sample = 0.0
+
+        sample = (sample - 0.5) * 2.0
+        sample *= 0.6 + 0.4 * tenseness
+
+        dc = dc_coeff * dc + (1.0 - dc_coeff) * sample
+        samples[i] = (sample - dc) * amp_env[i]
+
+    if breath_noise is not None and breath_gain > 0.0:
+        breath = _one_pole_lp(breath_noise.astype(np.float64), cutoff=3400.0, sr=sr)
+        samples += breath * breath_gain
+
+    if aspiration_noise is not None and aspiration_gain > 0.0:
+        asp = _one_pole_lp(aspiration_noise.astype(np.float64), cutoff=4600.0, sr=sr)
+        asp = _lip_radiation(asp)
+        samples += asp * aspiration_gain
+
+    tilt_cutoff = 1800.0 + 1800.0 * (1.0 - tenseness)
+    samples = _one_pole_lp(samples, cutoff=tilt_cutoff, sr=sr)
+    return samples.astype(DTYPE)
+
+
 def _glottal_source(
     f0: float,
     dur_s: float,
     sr: int,
     jitter_cents: float = 10.0,
     shimmer_db: float = 0.8,
+    glottal: Optional[GlottalModelParams] = None,
 ) -> np.ndarray:
-    """鋸波＋jitter/shimmer。位相加算で生成"""
-    rng = np.random.default_rng()
+    params = glottal or DEFAULT_GLOTTAL
+    if params.model.lower() in ("rosenberg", "lf", "flow"):
+        return _rosenberg_glottal_source(f0, dur_s, sr, jitter_cents, shimmer_db, params)
+
+    # Legacy sawtooth fallback
+    rng = np.random.default_rng(params.noise_seed)
     n = max(0, int(dur_s * sr))
     if n == 0:
         return np.zeros(0, dtype=DTYPE)
 
-    # jitter（AR一次）
     jn = rng.standard_normal(n).astype(DTYPE)
     pole = 0.999
     js = np.empty_like(jn)
@@ -410,22 +657,19 @@ def _glottal_source(
     cents = (jitter_cents / 100.0) * js
     inst_f = f0 * (2.0 ** (cents / 12.0))
 
-    # 位相加算で鋸波
     phase = np.cumsum(2.0 * pi * inst_f / sr, dtype=np.float64)
     saw = (2.0 * ((phase / (2.0 * pi)) % 1.0) - 1.0).astype(DTYPE)
 
-    # shimmer（AR一次）
     sn = rng.standard_normal(n).astype(DTYPE)
     ss = np.empty_like(sn)
     acc = 0.0
     for i in range(n):
         acc = pole * acc + (1.0 - pole) * sn[i]
         ss[i] = acc
-    amp = (_db_to_lin(shimmer_db) ** ss).astype(DTYPE)  # 10**((dB/20)*noise) と等価形
+    amp = (_db_to_lin(shimmer_db) ** ss).astype(DTYPE)
 
     raw = saw * amp
 
-    # 簡易 HP 抑制
     decay = exp(-2.0 * pi * 800.0 / sr)
     y = np.empty_like(raw)
     s = 0.0
@@ -475,12 +719,42 @@ def synth_vowel(
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
+    *,
+    speaker: Optional[SpeakerProfile] = None,
+    glottal: Optional[GlottalModelParams] = None,
+    articulationBlend: float = 0.65,
 ) -> np.ndarray:
-    """母音合成"""
-    assert vowel in VOWEL_TABLE, f"unsupported vowel: {vowel}"
-    src = _glottal_source(f0, durationSeconds, sampleRate, jitterCents, shimmerDb)
-    spec = VOWEL_TABLE[vowel]
-    y = _apply_formant_filters(src, spec['F'], spec['BW'], sampleRate)
+    """母音合成
+
+    Args:
+        vowel: Target vowel symbol.
+        f0: Fundamental frequency in Hz.
+        durationSeconds: Output duration.
+        speaker: Speaker profile controlling formant scaling / coloration.
+        glottal: Glottal model parameters. Defaults to a Rosenberg-style flow
+            source tuned for conversational Japanese speech.
+        articulationBlend: Weight (0-1) between the historical static formant
+            table and the articulatory predictor. 0 keeps legacy behavior, 1.0
+            uses only the articulatory model.
+    """
+
+    if vowel not in VOWEL_TABLE:
+        raise ValueError(f"unsupported vowel: {vowel}")
+
+    spk = speaker or DEFAULT_SPEAKER
+    base_spec = VOWEL_TABLE[vowel]
+    base_formants = _scale_formants_for_speaker(base_spec['F'], spk)
+    base_bandwidths = list(map(float, base_spec['BW']))
+
+    mix = _clamp(float(articulationBlend), 0.0, 1.0)
+    if mix > 0.0:
+        art_f, art_bw = _articulation_to_formants(vowel, spk)
+        formants, bws = _blend_formant_specs(base_formants, base_bandwidths, art_f, art_bw, mix)
+    else:
+        formants, bws = base_formants, base_bandwidths
+
+    src = _glottal_source(f0, durationSeconds, sampleRate, jitterCents, shimmerDb, glottal)
+    y = _apply_formant_filters(src, formants, bws, sampleRate)
     y = _add_breath_noise(y, breathLevelDb)
     return _normalize_peak(y, PEAK_DEFAULT)
 
@@ -594,10 +868,14 @@ def _synth_vowel_fixed(
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
+    *,
+    speaker: Optional[SpeakerProfile] = None,
+    glottal: Optional[GlottalModelParams] = None,
 ) -> np.ndarray:
     """与えたフォルマントで固定合成（短区間）"""
-    src = _glottal_source(f0, dur_s, sr, jitterCents, shimmerDb)
-    y = _apply_formant_filters(src, formants, bws, sr)
+    eff_formants = _scale_formants_for_speaker(formants, speaker)
+    src = _glottal_source(f0, dur_s, sr, jitterCents, shimmerDb, glottal)
+    y = _apply_formant_filters(src, eff_formants, bws, sr)
     y = _add_breath_noise(y, breathLevelDb)
     return _normalize_peak(y, PEAK_DEFAULT)
 
@@ -622,19 +900,39 @@ def synth_vowel_with_onset(
     onsetMilliseconds: int = 45,
     onsetFormants: Optional[Sequence[float]] = None,
     onsetBandwidthScale: float = 0.85,
+    *,
+    speaker: Optional[SpeakerProfile] = None,
+    glottal: Optional[GlottalModelParams] = None,
+    articulationBlend: float = 0.65,
 ) -> np.ndarray:
     """母音先頭だけフォルマント遷移を与える簡易版"""
     spec = VOWEL_TABLE[vowel]
     targetF, targetBW = spec['F'], spec['BW']
     if not onsetFormants:
-        return synth_vowel(vowel=vowel, f0=f0, durationSeconds=totalMilliseconds / 1000.0, sampleRate=sampleRate)
+        return synth_vowel(
+            vowel=vowel,
+            f0=f0,
+            durationSeconds=totalMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            speaker=speaker,
+            glottal=glottal,
+            articulationBlend=articulationBlend,
+        )
 
     total_ms = int(max(10, totalMilliseconds))
     onset_ms = int(max(1, min(onsetMilliseconds, total_ms - 1)))
     sustain_ms = max(0, total_ms - onset_ms)
 
     onsetBW = [bw * float(onsetBandwidthScale) for bw in targetBW]
-    onset = _synth_vowel_fixed(onsetFormants, onsetBW, f0, onset_ms / 1000.0, sampleRate)
+    onset = _synth_vowel_fixed(
+        onsetFormants,
+        onsetBW,
+        f0,
+        onset_ms / 1000.0,
+        sampleRate,
+        speaker=speaker,
+        glottal=glottal,
+    )
     onset = _apply_fade(onset, sampleRate, attack_ms=6.0, release_ms=min(12.0, onset_ms * 0.5))
 
     if sustain_ms <= 0:
@@ -643,7 +941,15 @@ def synth_vowel_with_onset(
     ov_ms = min(max(6.0, onset_ms * 0.45), 14.0, float(sustain_ms))
     rest_len_ms = sustain_ms + max(0.0, ov_ms)
 
-    sustain = _synth_vowel_fixed(targetF, targetBW, f0, rest_len_ms / 1000.0, sampleRate)
+    sustain = _synth_vowel_fixed(
+        targetF,
+        targetBW,
+        f0,
+        rest_len_ms / 1000.0,
+        sampleRate,
+        speaker=speaker,
+        glottal=glottal,
+    )
     sustain = _apply_fade(sustain, sampleRate, attack_ms=4.0, release_ms=12.0)
 
     return _crossfade(onset, sustain, sampleRate, overlap_ms=ov_ms)
@@ -724,7 +1030,10 @@ def synth_nasal(
     consonant: str = 'n',
     f0: float = 120.0,
     durationMilliseconds: float = 90.0,
-    sampleRate: int = 22050
+    sampleRate: int = 22050,
+    *,
+    speaker: Optional[SpeakerProfile] = None,
+    glottal: Optional[GlottalModelParams] = None,
 ) -> np.ndarray:
     """簡易的な鼻音 /n/, /m/"""
     c = consonant.lower()
@@ -733,8 +1042,18 @@ def synth_nasal(
 
     dur_s = max(20.0, float(durationMilliseconds)) / 1000.0
     spec = NASAL_PRESETS[c]
-    y = _synth_vowel_fixed(spec['F'], spec['BW'], f0, dur_s, sampleRate,
-                           jitterCents=4.0, shimmerDb=0.4, breathLevelDb=-38.0)
+    y = _synth_vowel_fixed(
+        spec['F'],
+        spec['BW'],
+        f0,
+        dur_s,
+        sampleRate,
+        jitterCents=4.0,
+        shimmerDb=0.4,
+        breathLevelDb=-38.0,
+        speaker=speaker,
+        glottal=glottal,
+    )
     y = _apply_fade(y, sampleRate,
                     attack_ms=8.0 if c == 'n' else 10.0,
                     release_ms=22.0 if c == 'n' else 28.0)
@@ -752,6 +1071,10 @@ def synth_cv(
     vowelMilliseconds: int = 240,
     overlapMilliseconds: int = 30,
     useOnsetTransition: bool = False,
+    *,
+    speaker: Optional[SpeakerProfile] = None,
+    glottal: Optional[GlottalModelParams] = None,
+    articulationBlend: float = 0.65,
 ) -> np.ndarray:
     """子音 + 母音（50音相当までカバー）"""
     c = cons.lower()
@@ -766,7 +1089,15 @@ def synth_cv(
         default_ms = {'s': 160.0, 'sh': 150.0}[c]
         fric_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else default_ms
         fric = synth_fricative(c, durationSeconds=fric_ms / 1000.0, sampleRate=sampleRate, levelDb=level)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            speaker=speaker,
+            glottal=glottal,
+            articulationBlend=articulationBlend,
+        )
         out = _crossfade(fric, vow, sampleRate, overlap_ms=max(24, overlapMilliseconds))
 
     elif c in ('h', 'f'):
@@ -774,7 +1105,15 @@ def synth_cv(
         cons_len = float(consonantMilliseconds) if consonantMilliseconds is not None else default_ms
         cons_len = max(0.0, cons_len)
         sil = np.zeros(_ms_to_samples(cons_len, sampleRate), dtype=DTYPE)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            speaker=speaker,
+            glottal=glottal,
+            articulationBlend=articulationBlend,
+        )
 
         req_ov = float(overlapMilliseconds) if consonantMilliseconds is not None else 12.0
         eff_ov = min(12.0, cons_len, max(0.0, req_ov))
@@ -785,10 +1124,27 @@ def synth_cv(
         plo = synth_plosive(c, sampleRate=sampleRate)
         if useOnsetTransition and v == 'a':
             onsetF = [800, 1800, 3000] if c == 't' else [800, 2200, 2400]
-            vow = synth_vowel_with_onset('a', f0, sampleRate, totalMilliseconds=vowelMilliseconds,
-                                         onsetMilliseconds=45, onsetFormants=onsetF)
+            vow = synth_vowel_with_onset(
+                'a',
+                f0,
+                sampleRate,
+                totalMilliseconds=vowelMilliseconds,
+                onsetMilliseconds=45,
+                onsetFormants=onsetF,
+                speaker=speaker,
+                glottal=glottal,
+                articulationBlend=articulationBlend,
+            )
         else:
-            vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+            vow = synth_vowel(
+                vowel=v,
+                f0=f0,
+                durationSeconds=vowelMilliseconds / 1000.0,
+                sampleRate=sampleRate,
+                speaker=speaker,
+                glottal=glottal,
+                articulationBlend=articulationBlend,
+            )
 
         try:
             req = int(overlapMilliseconds)
@@ -799,27 +1155,63 @@ def synth_cv(
 
     elif c in ('ch', 'ts'):
         aff = synth_affricate(c, sampleRate=sampleRate)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            speaker=speaker,
+            glottal=glottal,
+            articulationBlend=articulationBlend,
+        )
         out = _crossfade(aff, vow, sampleRate, overlap_ms=max(12, min(overlapMilliseconds, 18)))
 
     elif c == 'n':
         nasal_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 90.0
-        nasal = synth_nasal('n', f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        nasal = synth_nasal('n', f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate,
+                             speaker=speaker, glottal=glottal)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            speaker=speaker,
+            glottal=glottal,
+            articulationBlend=articulationBlend,
+        )
         out = _crossfade(nasal, vow, sampleRate, overlap_ms=max(25, overlapMilliseconds))
 
     elif c == 'm':
         nasal_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 110.0
-        nasal = synth_nasal('m', f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate)
-        vow = synth_vowel(vowel=v, f0=f0, durationSeconds=vowelMilliseconds / 1000.0, sampleRate=sampleRate)
+        nasal = synth_nasal('m', f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate,
+                             speaker=speaker, glottal=glottal)
+        vow = synth_vowel(
+            vowel=v,
+            f0=f0,
+            durationSeconds=vowelMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            speaker=speaker,
+            glottal=glottal,
+            articulationBlend=articulationBlend,
+        )
         out = _crossfade(nasal, vow, sampleRate, overlap_ms=max(28, overlapMilliseconds))
 
     elif c == 'w':
         onset_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 44.0
         onset_ms = max(24.0, min(onset_ms, float(vowelMilliseconds) - 8.0))
         onsetF = GLIDE_ONSETS['w'].get(v, GLIDE_ONSETS['w']['a'])
-        out = synth_vowel_with_onset(v, f0, sampleRate, totalMilliseconds=vowelMilliseconds,
-                                     onsetMilliseconds=int(onset_ms), onsetFormants=onsetF, onsetBandwidthScale=1.18)
+        out = synth_vowel_with_onset(
+            v,
+            f0,
+            sampleRate,
+            totalMilliseconds=vowelMilliseconds,
+            onsetMilliseconds=int(onset_ms),
+            onsetFormants=onsetF,
+            onsetBandwidthScale=1.18,
+            speaker=speaker,
+            glottal=glottal,
+            articulationBlend=articulationBlend,
+        )
         out = _pre_emphasis(out, coefficient=0.86)
         out = _add_breath_noise(out, level_db=-36.0)
         out = _normalize_peak(out, PEAK_DEFAULT)
@@ -828,8 +1220,18 @@ def synth_cv(
         onset_ms = float(consonantMilliseconds) if consonantMilliseconds is not None else 40.0
         onset_ms = max(24.0, min(onset_ms, float(vowelMilliseconds) - 10.0))
         onsetF = GLIDE_ONSETS['y'].get(v, GLIDE_ONSETS['y']['a'])
-        out = synth_vowel_with_onset(v, f0, sampleRate, totalMilliseconds=vowelMilliseconds,
-                                     onsetMilliseconds=int(onset_ms), onsetFormants=onsetF, onsetBandwidthScale=1.10)
+        out = synth_vowel_with_onset(
+            v,
+            f0,
+            sampleRate,
+            totalMilliseconds=vowelMilliseconds,
+            onsetMilliseconds=int(onset_ms),
+            onsetFormants=onsetF,
+            onsetBandwidthScale=1.10,
+            speaker=speaker,
+            glottal=glottal,
+            articulationBlend=articulationBlend,
+        )
         out = _pre_emphasis(out, coefficient=0.84)
         out = _add_breath_noise(out, level_db=-38.0)
         out = _normalize_peak(out, PEAK_DEFAULT)
@@ -838,8 +1240,17 @@ def synth_cv(
         tap = synth_plosive('t', sampleRate=sampleRate, closureMilliseconds=12.0, burstMilliseconds=6.0,
                             aspirationMilliseconds=4.0, levelDb=-20.0)
         onsetF = LIQUID_ONSETS.get(v, LIQUID_ONSETS['a'])
-        vow = synth_vowel_with_onset(v, f0, sampleRate, totalMilliseconds=vowelMilliseconds,
-                                     onsetMilliseconds=36, onsetFormants=onsetF)
+        vow = synth_vowel_with_onset(
+            v,
+            f0,
+            sampleRate,
+            totalMilliseconds=vowelMilliseconds,
+            onsetMilliseconds=36,
+            onsetFormants=onsetF,
+            speaker=speaker,
+            glottal=glottal,
+            articulationBlend=articulationBlend,
+        )
         out = _crossfade(tap, vow, sampleRate, overlap_ms=12)
 
     else:
@@ -863,6 +1274,10 @@ def synth_cv_to_wav(
     vowelMilliseconds: int = 240,
     overlapMilliseconds: int = 30,
     useOnsetTransition: bool = False,
+    *,
+    speaker: Optional[SpeakerProfile] = None,
+    glottal: Optional[GlottalModelParams] = None,
+    articulationBlend: float = 0.65,
 ) -> str:
     """CV を合成して WAV 保存"""
     waveform = synth_cv(
@@ -875,6 +1290,9 @@ def synth_cv_to_wav(
         vowelMilliseconds=vowelMilliseconds,
         overlapMilliseconds=overlapMilliseconds,
         useOnsetTransition=useOnsetTransition,
+        speaker=speaker,
+        glottal=glottal,
+        articulationBlend=articulationBlend,
     )
     return write_wav(outPath, waveform, sampleRate=sampleRate)
 
@@ -886,12 +1304,24 @@ def synth_phrase_to_wav(
     unitMilliseconds: int = 220,
     gapMilliseconds: int = 30,
     sampleRate: int = 22050,
+    *,
+    speaker: Optional[SpeakerProfile] = None,
+    glottal: Optional[GlottalModelParams] = None,
+    articulationBlend: float = 0.65,
 ) -> str:
     """MVP: 母音列 ['a','i',...] からフレーズ WAV を生成"""
     chunks: List[np.ndarray] = []
     for v in map(str.lower, vowels):
         if v in VOWEL_TABLE:
-            seg = synth_vowel(v, f0=f0, durationSeconds=unitMilliseconds / 1000.0, sampleRate=sampleRate)
+            seg = synth_vowel(
+                v,
+                f0=f0,
+                durationSeconds=unitMilliseconds / 1000.0,
+                sampleRate=sampleRate,
+                speaker=speaker,
+                glottal=glottal,
+                articulationBlend=articulationBlend,
+            )
             chunks.append(seg)
             chunks.append(np.zeros(_ms_to_samples(gapMilliseconds, sampleRate), dtype=DTYPE))
     if not chunks:
@@ -910,6 +1340,9 @@ def synth_token_sequence(
     gapMilliseconds: int = 40,
     tokenCrossfadeMilliseconds: int = 12,
     useOnsetTransition: bool = False,
+    speaker: Optional[SpeakerProfile] = None,
+    glottal: Optional[GlottalModelParams] = None,
+    articulationBlend: float = 0.65,
 ) -> np.ndarray:
     """ローマ字トークン列から波形を生成するヘルパー。
 
@@ -938,14 +1371,37 @@ def synth_token_sequence(
             continue
         if t in CV_TOKEN_MAP:
             ck, vk = CV_TOKEN_MAP[t]
-            seg = synth_cv(ck, vk, f0=f0, sampleRate=sampleRate,
-                           vowelMilliseconds=vowelMilliseconds,
-                           overlapMilliseconds=overlapMilliseconds,
-                           useOnsetTransition=useOnsetTransition)
+            seg = synth_cv(
+                ck,
+                vk,
+                f0=f0,
+                sampleRate=sampleRate,
+                vowelMilliseconds=vowelMilliseconds,
+                overlapMilliseconds=overlapMilliseconds,
+                useOnsetTransition=useOnsetTransition,
+                speaker=speaker,
+                glottal=glottal,
+                articulationBlend=articulationBlend,
+            )
         elif t in VOWEL_TABLE:
-            seg = synth_vowel(t, f0=f0, durationSeconds=vow_sec, sampleRate=sampleRate)
+            seg = synth_vowel(
+                t,
+                f0=f0,
+                durationSeconds=vow_sec,
+                sampleRate=sampleRate,
+                speaker=speaker,
+                glottal=glottal,
+                articulationBlend=articulationBlend,
+            )
         elif t in NASAL_TOKEN_MAP:
-            seg = synth_nasal(NASAL_TOKEN_MAP[t], f0=f0, durationMilliseconds=nasal_ms, sampleRate=sampleRate)
+            seg = synth_nasal(
+                NASAL_TOKEN_MAP[t],
+                f0=f0,
+                durationMilliseconds=nasal_ms,
+                sampleRate=sampleRate,
+                speaker=speaker,
+                glottal=glottal,
+            )
         else:
             raise ValueError(f"Unsupported token '{tok}' for synthesis")
 
@@ -983,6 +1439,9 @@ def synth_tokens_to_wav(
     gapMilliseconds: int = 40,
     tokenCrossfadeMilliseconds: int = 12,
     useOnsetTransition: bool = False,
+    speaker: Optional[SpeakerProfile] = None,
+    glottal: Optional[GlottalModelParams] = None,
+    articulationBlend: float = 0.65,
 ) -> str:
     """トークン列合成 → WAV 保存。"""
     y = synth_token_sequence(
@@ -994,6 +1453,9 @@ def synth_tokens_to_wav(
         gapMilliseconds=gapMilliseconds,
         tokenCrossfadeMilliseconds=tokenCrossfadeMilliseconds,
         useOnsetTransition=useOnsetTransition,
+        speaker=speaker,
+        glottal=glottal,
+        articulationBlend=articulationBlend,
     )
     return write_wav(outPath, y, sampleRate=sampleRate)
 
