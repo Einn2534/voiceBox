@@ -208,14 +208,12 @@ def _reflection_to_lpc(reflection: Iterable[float]) -> np.ndarray:
     return a
 
 
-def area_profile_to_formants(
+def _area_profile_to_reflections(
     area_profile: Sequence[float],
     *,
-    nFormants: int = 3,
     lipReflection: float = -0.85,
-    wallLoss: float = 0.996,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Estimate formant frequencies/bandwidths from a Kelly-Lochbaum area profile."""
+) -> np.ndarray:
+    """Convert a Kelly-Lochbaum area profile to reflection coefficients."""
 
     areas = np.asarray(area_profile, dtype=np.float64)
     if areas.ndim != 1 or len(areas) < 2:
@@ -229,6 +227,23 @@ def area_profile_to_formants(
         else:
             refl.append((right - left) / denom)
     refl.append(float(_clamp(lipReflection, -0.999, 0.0)))
+    return np.asarray(refl, dtype=np.float64)
+
+
+def area_profile_to_formants(
+    area_profile: Sequence[float],
+    *,
+    nFormants: int = 3,
+    lipReflection: float = -0.85,
+    wallLoss: float = 0.996,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Estimate formant frequencies/bandwidths from a Kelly-Lochbaum area profile."""
+
+    areas = np.asarray(area_profile, dtype=np.float64)
+    if areas.ndim != 1 or len(areas) < 2:
+        raise ValueError('area_profile must be a 1-D sequence with >=2 elements')
+
+    refl = _area_profile_to_reflections(areas, lipReflection=lipReflection)
 
     a_poly = _reflection_to_lpc(refl)
     roots = np.roots(a_poly)
@@ -621,6 +636,52 @@ def _apply_formant_filters(src: np.ndarray, formants: Sequence[float], bws: Sequ
     return _lip_radiation(out)
 
 
+def _apply_all_pole_filter(src: np.ndarray, a_coeffs: np.ndarray) -> np.ndarray:
+    """Apply an all-pole filter defined by ``a_coeffs`` (a[0] == 1)."""
+
+    x = np.asarray(src, dtype=np.float64)
+    if x.ndim != 1:
+        raise ValueError('src must be one-dimensional')
+
+    order = len(a_coeffs) - 1
+    if order <= 0:
+        return x.astype(DTYPE, copy=False)
+
+    y = np.empty_like(x, dtype=np.float64)
+    for n in range(len(x)):
+        acc = x[n]
+        for k in range(1, order + 1):
+            if n - k >= 0:
+                acc -= a_coeffs[k] * y[n - k]
+        y[n] = acc
+    return y.astype(DTYPE, copy=False)
+
+
+def _apply_kelly_lochbaum_filter(
+    src: np.ndarray,
+    area_profile: Sequence[float],
+    sr: int,
+    *,
+    lipReflection: float = -0.85,
+    wallLoss: float = 0.996,
+    applyRadiation: bool = True,
+) -> np.ndarray:
+    """Filter ``src`` via a Kelly-Lochbaum (two-port) vocal-tract model."""
+
+    if len(src) == 0:
+        return np.zeros(0, dtype=DTYPE)
+
+    refl = _area_profile_to_reflections(area_profile, lipReflection=lipReflection)
+    if wallLoss != 1.0:
+        refl = np.clip(refl * float(wallLoss), -0.999, 0.999)
+
+    a_poly = _reflection_to_lpc(refl)
+    y = _apply_all_pole_filter(src, a_poly)
+    if applyRadiation:
+        y = _lip_radiation(y)
+    return y
+
+
 def synth_vowel(
     vowel: str = 'a',
     f0: float = 120.0,
@@ -634,6 +695,9 @@ def synth_vowel(
     articulation: Optional[Dict[str, float]] = None,
     areaProfile: Optional[Sequence[float]] = None,
     kellySections: Optional[int] = None,
+    useLegacyFormantFilter: bool = True,
+    waveguideLipReflection: float = -0.85,
+    waveguideWallLoss: float = 0.996,
 ) -> np.ndarray:
     """母音合成"""
     assert vowel in VOWEL_TABLE, f"unsupported vowel: {vowel}"
@@ -649,20 +713,26 @@ def synth_vowel(
     bws = np.array(spec['BW'], dtype=np.float64)
 
     k_sections = int(kellySections) if kellySections else len(_NEUTRAL_TRACT_AREA_CM2)
+    profile_custom: Optional[np.ndarray] = None
+    if areaProfile is not None:
+        profile_custom = np.asarray(areaProfile, dtype=np.float64)
+        if profile_custom.ndim != 1:
+            raise ValueError('areaProfile must be one-dimensional')
+        if k_sections and len(profile_custom) != k_sections:
+            profile_custom = _resample_profile(profile_custom.astype(np.float64), k_sections)
+    elif articulation is not None:
+        profile_custom = generate_kelly_lochbaum_profile(numSections=k_sections, articulation=articulation or {})
+
     new_formants: Optional[np.ndarray] = None
     new_bw: Optional[np.ndarray] = None
-
-    if areaProfile is not None or articulation is not None or blend > 0.0:
-        if areaProfile is not None:
-            profile = np.asarray(areaProfile, dtype=np.float64)
-            if profile.ndim != 1:
-                raise ValueError('areaProfile must be one-dimensional')
-            if k_sections and len(profile) != k_sections:
-                profile = _resample_profile(profile.astype(np.float64), k_sections)
-        else:
-            profile = generate_kelly_lochbaum_profile(numSections=k_sections, articulation=articulation or {})
+    if profile_custom is not None:
         try:
-            new_formants, new_bw = area_profile_to_formants(profile, nFormants=len(formants))
+            new_formants, new_bw = area_profile_to_formants(
+                profile_custom,
+                nFormants=len(formants),
+                lipReflection=waveguideLipReflection,
+                wallLoss=waveguideWallLoss,
+            )
         except Exception:
             new_formants, new_bw = None, None
 
@@ -677,7 +747,34 @@ def synth_vowel(
         formants = (1.0 - blend) * formants + blend * new_formants
         bws = (1.0 - blend) * bws + blend * new_bw
 
-    y = _apply_formant_filters(src, formants, bws, sampleRate)
+    if useLegacyFormantFilter:
+        y = _apply_formant_filters(src, formants, bws, sampleRate)
+    else:
+        neutral_profile: Optional[np.ndarray] = None
+
+        def _neutral_profile() -> np.ndarray:
+            nonlocal neutral_profile
+            if neutral_profile is None:
+                neutral_profile = generate_kelly_lochbaum_profile(numSections=k_sections, articulation={})
+            return neutral_profile
+
+        if profile_custom is None:
+            profile_waveguide = _neutral_profile()
+        else:
+            if blend <= 0.0:
+                profile_waveguide = _neutral_profile()
+            elif blend >= 1.0:
+                profile_waveguide = profile_custom
+            else:
+                profile_waveguide = np.clip((1.0 - blend) * _neutral_profile() + blend * profile_custom, 0.05, None)
+        y = _apply_kelly_lochbaum_filter(
+            src,
+            profile_waveguide,
+            sampleRate,
+            lipReflection=waveguideLipReflection,
+            wallLoss=waveguideWallLoss,
+            applyRadiation=True,
+        )
     y = _add_breath_noise(y, breathLevelDb)
     return _normalize_peak(y, PEAK_DEFAULT)
 
@@ -791,10 +888,39 @@ def _synth_vowel_fixed(
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
+    *,
+    areaProfile: Optional[Sequence[float]] = None,
+    articulation: Optional[Dict[str, float]] = None,
+    kellySections: Optional[int] = None,
+    useLegacyFormantFilter: bool = True,
+    waveguideLipReflection: float = -0.85,
+    waveguideWallLoss: float = 0.996,
 ) -> np.ndarray:
     """与えたフォルマントで固定合成（短区間）"""
     src = _glottal_source(f0, dur_s, sr, jitterCents, shimmerDb)
-    y = _apply_formant_filters(src, formants, bws, sr)
+    if useLegacyFormantFilter:
+        y = _apply_formant_filters(src, formants, bws, sr)
+    else:
+        sections = int(kellySections) if kellySections else len(_NEUTRAL_TRACT_AREA_CM2)
+        profile: Optional[np.ndarray]
+        if areaProfile is not None:
+            profile = np.asarray(areaProfile, dtype=np.float64)
+            if profile.ndim != 1:
+                raise ValueError('areaProfile must be one-dimensional')
+            if sections and len(profile) != sections:
+                profile = _resample_profile(profile.astype(np.float64), sections)
+        elif articulation is not None:
+            profile = generate_kelly_lochbaum_profile(numSections=sections, articulation=articulation or {})
+        else:
+            profile = generate_kelly_lochbaum_profile(numSections=sections, articulation={})
+        y = _apply_kelly_lochbaum_filter(
+            src,
+            profile,
+            sr,
+            lipReflection=waveguideLipReflection,
+            wallLoss=waveguideWallLoss,
+            applyRadiation=True,
+        )
     y = _add_breath_noise(y, breathLevelDb)
     return _normalize_peak(y, PEAK_DEFAULT)
 
@@ -825,6 +951,14 @@ def synth_vowel_with_onset(
     spec = VOWEL_TABLE[vowel]
     targetF, targetBW = spec['F'], spec['BW']
     vowel_kwargs = dict(vowelModel or {})
+    waveguide_opts = {
+        'areaProfile': vowel_kwargs.get('areaProfile'),
+        'articulation': vowel_kwargs.get('articulation'),
+        'kellySections': vowel_kwargs.get('kellySections'),
+        'useLegacyFormantFilter': vowel_kwargs.get('useLegacyFormantFilter', True),
+        'waveguideLipReflection': vowel_kwargs.get('waveguideLipReflection', -0.85),
+        'waveguideWallLoss': vowel_kwargs.get('waveguideWallLoss', 0.996),
+    }
 
     if not onsetFormants:
         return synth_vowel(
@@ -840,7 +974,14 @@ def synth_vowel_with_onset(
     sustain_ms = max(0, total_ms - onset_ms)
 
     onsetBW = [bw * float(onsetBandwidthScale) for bw in targetBW]
-    onset = _synth_vowel_fixed(onsetFormants, onsetBW, f0, onset_ms / 1000.0, sampleRate)
+    onset = _synth_vowel_fixed(
+        onsetFormants,
+        onsetBW,
+        f0,
+        onset_ms / 1000.0,
+        sampleRate,
+        **waveguide_opts,
+    )
     onset = _apply_fade(onset, sampleRate, attack_ms=6.0, release_ms=min(12.0, onset_ms * 0.5))
 
     if sustain_ms <= 0:
@@ -858,7 +999,14 @@ def synth_vowel_with_onset(
             **vowel_kwargs,
         )
     else:
-        sustain = _synth_vowel_fixed(targetF, targetBW, f0, rest_len_ms / 1000.0, sampleRate)
+        sustain = _synth_vowel_fixed(
+            targetF,
+            targetBW,
+            f0,
+            rest_len_ms / 1000.0,
+            sampleRate,
+            **waveguide_opts,
+        )
     sustain = _apply_fade(sustain, sampleRate, attack_ms=4.0, release_ms=12.0)
 
     return _crossfade(onset, sustain, sampleRate, overlap_ms=ov_ms)
