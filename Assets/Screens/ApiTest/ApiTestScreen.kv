@@ -6,20 +6,23 @@
 <ApiTestScreen>:
     BoxLayout:
         orientation: 'vertical'
-        Label:
-            id: apiResponse
-            text: "ApiTestScreen"
-            font_name: app.font_name
+        ScrollView:
+            Label:
+                id: apiResponse
+                text: "ApiTestScreen"
+                size_hint_y: None                     # 高さを自動で設定するために固定
+                height: self.texture_size[1]          # テキストの高さに合わせる
+                text_size: self.width, None           # 折り返しを有効にする（横幅に合わせて改行）
+                halign: "left"
+                valign: "top"
+
         BoxLayout:
             TextInput:
                 id: apiRequest
                 hint_text: 'apiRequest'
-                font_name: app.font_name
             Button:
                 text: "Enter"
                 on_press: root.send_text()
-                font_name: app.font_name
         Button:
             text: "Top"
             on_press: app.root.current = 'home'
-            font_name: app.font_name

@@ -87,6 +87,7 @@ class ApiTestScreen(Screen):
     def on_leave(self):
         """Just before leaving the screen"""
         self.running = False
+        self.ids.apiRequest.text = ''
         if hasattr(self, "audio_stream") and self.audio_stream:
             self.audio_stream.close()
 
@@ -127,10 +128,12 @@ class ApiTestScreen(Screen):
             return
 
         user_input = self.ids.apiRequest.text.strip()
+        self.ids.apiRequest.text = ''
         if not user_input:
             print("入力不備")
             return
 
+        self.update_label('User', user_input)
         # asyncioのコルーチンを別スレッドのループ上で安全に実行
         asyncio.run_coroutine_threadsafe(self._async_send_text(user_input), self.loop)
 
@@ -160,25 +163,26 @@ class ApiTestScreen(Screen):
                     if text := response.text:
                         full_text += text
                         # 部分的なテキストもリアルタイムにLabelへ反映
-                        Clock.schedule_once(lambda dt, t=text: self.update_label(t))
+                        # Clock.schedule_once(lambda dt, t=text: self.update_label(t))
 
                 if full_text:
                     # 最終的な全テキストも更新
-                    Clock.schedule_once(lambda dt, t=full_text: self.update_label(t))
+                    Clock.schedule_once(lambda dt, t=full_text: self.update_label('GIAN', t))
 
         except Exception as e:
             print("receive_text error:", e)
             Clock.schedule_once(lambda dt: setattr(self.ids.apiResponse, "text", f"受信エラー: {e}"))
 
-    def update_label(self, text):
+    def update_label(self, speaker, text):
         """
         Update a Label on the UI thread
         
         Keyword arguments:
         text -- Update label text
         """
-        
+
         if hasattr(self, "ids") and "apiResponse" in self.ids:
-            self.ids.apiResponse.text = text
+            self.ids.apiResponse.text += f"\n\n{speaker} >>\n{text}"
+            Clock.schedule_once(lambda dt: setattr(self.ids.apiResponse.parent, 'scroll_y', 0))
         else:
             print("⚠️ Label(apiResponse) が見つかりません")
