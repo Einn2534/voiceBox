@@ -32,7 +32,7 @@ LabelBase.register(
 
 Builder.load_file('Assets/Screens/VoiceTest/VoiceTestScreen.kv')
 
-GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GEMINI_API_KEY_ENV = 'AIzaSyBC0-gE_aSsMXNL0fvFApzijUkEPRC8wSc' 
 MODEL_NAME = "models/gemini-2.0-flash-live-001"
 CONNECTION_POLL_INTERVAL = 0.1
 SPEECH_QUEUE_MAXSIZE = 5
