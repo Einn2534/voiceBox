@@ -110,16 +110,17 @@ class VoiceTestScreen(Screen):
         """Maintain the Gemini Live connection and coordinate message handling."""
         if not self._client:
             return
+        receiver_task: Optional[asyncio.Task] = None
         try:
-            async with (
-                self._client.aio.live.connect(model=MODEL_NAME, config=self._live_config) as session,
-                asyncio.TaskGroup() as task_group,
-            ):
+            async with self._client.aio.live.connect(
+                model=MODEL_NAME,
+                config=self._live_config,
+            ) as session:
                 self.session = session
                 self.audio_in_queue = asyncio.Queue()
                 self.out_queue = asyncio.Queue(maxsize=SPEECH_QUEUE_MAXSIZE)
                 self.running = True
-                task_group.create_task(self.receive_text())
+                receiver_task = asyncio.create_task(self.receive_text())
                 Clock.schedule_once(lambda dt: setattr(self.ids.apiResponse, "text", "Connected"))
                 while self.running:
                     await asyncio.sleep(CONNECTION_POLL_INTERVAL)
@@ -131,6 +132,12 @@ class VoiceTestScreen(Screen):
         finally:
             self.running = False
             self.session = None
+            if receiver_task is not None:
+                receiver_task.cancel()
+                try:
+                    await receiver_task
+                except asyncio.CancelledError:
+                    pass
             Clock.schedule_once(lambda dt: setattr(self.ids.apiResponse, "text", "Disconnect"))
 
     def send_text(self):
