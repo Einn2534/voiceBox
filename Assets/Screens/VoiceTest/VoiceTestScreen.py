@@ -6,7 +6,7 @@
 from kivy.uix.screenmanager import Screen
 from kivy.lang import Builder
 from kivy.core.text import LabelBase
-from kivy.clock import Clock    # Kivyのメインスレッドで安全にUI更新を行うためのタイマー管理。非同期処理の中で画面を更新する際に必須。
+from kivy.clock import Clock    # Kivyのメインスレッドで安全にUI更新を行うためのタイマー管理。非同期処理の中で画面を更新するときに必須。
 
 import asyncio      # 非同期処理
 import threading    # スレッド（軽量な並列実行）を扱う
@@ -15,18 +15,17 @@ import re
 import time
 from typing import Iterable, List, Optional
 
-from Assets.Common.gemini import (
-    DEFAULT_MODEL,
-    GeminiConfigError,
-    build_live_config,
-    get_gemini_client,
-)
+from google import genai
+from google.genai import types
+
 
 
 import traceback    # エラー発生時の詳細なスタックトレースを取得
 
 import pyaudio      # マイク入力・スピーカー出力を扱う
 import numpy as np  # 数値計算用ライブラリ 音声波形データの加工・正規化
+
+import argparse     # コマンドライン引数の解析
 
 from Assets.Common.Audio.DigitalSignalProcessing import text_to_tokens, synth_token_sequence
 
@@ -42,15 +41,18 @@ Builder.load_file('Assets/Screens/VoiceTest/VoiceTestScreen.kv')
 # -------------------
 # Gemini API設定
 # -------------------
-MODEL = DEFAULT_MODEL
-CONFIG = build_live_config()
+GEMINI_API_KEY = 'AIzaSyBC0-gE_aSsMXNL0fvFApzijUkEPRC8wSc'  # APIキー
+MODEL = "models/gemini-2.0-flash-live-001"
 
-try:
-    client = get_gemini_client()
-    _client_error: Exception | None = None
-except GeminiConfigError as error:
-    client = None
-    _client_error = error
+client = genai.Client(
+    http_options={"api_version": "v1beta"},
+    api_key=GEMINI_API_KEY,
+)
+
+CONFIG = types.LiveConnectConfig(
+    system_instruction=types.Content(parts=[types.Part(text="あなたは優秀な英語AIアシスタントです。")]),
+    response_modalities=["text"],
+)
 
 # -------------------
 # 音声設定
@@ -90,15 +92,6 @@ class VoiceTestScreen(Screen):
         
         print("VoiceTest Screen Entered!")
         self.ids.apiResponse.text = "Connecting..."
-
-        if _client_error is not None:
-            self.ids.apiResponse.text = f"Config error: {_client_error}"
-            return
-
-        if client is None:
-            self.ids.apiResponse.text = "Gemini client unavailable"
-            return
-
         self._start_speech_worker()
 
         # 非同期ループを作成して別スレッドで起動
@@ -118,18 +111,6 @@ class VoiceTestScreen(Screen):
 
     async def run_audio_loop(self):
         """Gemini Live Connection Loop"""
-        if _client_error is not None:
-            Clock.schedule_once(
-                lambda dt: setattr(self.ids.apiResponse, "text", f"Config error: {_client_error}")
-            )
-            return
-
-        if client is None:
-            Clock.schedule_once(
-                lambda dt: setattr(self.ids.apiResponse, "text", "Gemini client unavailable")
-            )
-            return
-
         try:
             async with (
                 client.aio.live.connect(model=MODEL, config=CONFIG) as session,
