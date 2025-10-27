@@ -1,12 +1,12 @@
 # GIAN Voice Box
 
-## Requirements
-- Python 3.10 or newer
-- Virtual environment tool such as `venv`
-- System packages required by [PyAudio](https://people.csail.mit.edu/hubert/pyaudio/#downloads) (PortAudio)
-- An environment variable named `GEMINI_API_KEY` that contains a valid Gemini Live API key
+## 必要要件
+- Python 3.10 以上
+- `venv` などの仮想環境ツール
+- [PyAudio](https://people.csail.mit.edu/hubert/pyaudio/#downloads) が依存する PortAudio 等のシステムパッケージ
+- 有効な Gemini Live API キーを保持した環境変数 `GEMINI_API_KEY`
 
-Install the Python dependencies before running the application:
+アプリを起動する前に Python 依存パッケージをインストールしてください。
 
 ```bash
 python -m venv .venv
@@ -14,15 +14,15 @@ source .venv/bin/activate
 pip install kivy google-genai numpy pyaudio
 ```
 
-## Running the application
-1. Activate the virtual environment (if not already active).
-2. Export the Gemini API key so the voice test screen can authenticate:
+## 起動手順
+1. 仮想環境を有効化します（未実行の場合）。
+2. 音声テスト画面が認証できるよう Gemini API キーをエクスポートします。
    ```bash
    export GEMINI_API_KEY="<your_api_key>"
    ```
-3. Start the Kivy application:
+3. Kivy アプリケーションを起動します。
    ```bash
    python Main.py
    ```
 
-The home screen loads first. Navigate to the voice test screen to begin an interactive Gemini Live session with synthesized audio playback.
+起動後はホーム画面が表示されます。音声テスト画面へ遷移すると Gemini Live と音声合成による対話を開始できます。
