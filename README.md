@@ -4,6 +4,7 @@
 - Python 3.10 以上
 - `venv` などの仮想環境ツール
 - [PyAudio](https://people.csail.mit.edu/hubert/pyaudio/#downloads) が依存する PortAudio 等のシステムパッケージ
+- 有効な Gemini Live API キーを保持した環境変数 `GEMINI_API_KEY`
 
 ## セットアップ
 1. プロジェクトルートで仮想環境を作成します。
@@ -30,11 +31,22 @@
 
 ## 起動手順
 1. 仮想環境を有効化します（未実行の場合）。
-2. Kivy アプリケーションを起動します。
+2. Gemini API キーを環境変数に設定します。
+   - macOS / Linux
+     ```bash
+     export GEMINI_API_KEY="<your_api_key>"
+     ```
+   - Windows (PowerShell)
+     ```powershell
+     $env:GEMINI_API_KEY = "<your_api_key>"
+     ```
+   - Windows (コマンドプロンプト)
+     ```bat
+     set GEMINI_API_KEY=<your_api_key>
+     ```
+3. Kivy アプリケーションを起動します。
    ```bash
    python Main.py
    ```
-
-Gemini API キーはプロジェクト内に直接定義されています。別途環境変数を設定する必要はありませんが、運用環境で使用する際はキーの保護方法を再検討してください。
 
 起動後はホーム画面が表示されます。音声テスト画面へ遷移すると Gemini Live と音声合成による対話を開始できます。

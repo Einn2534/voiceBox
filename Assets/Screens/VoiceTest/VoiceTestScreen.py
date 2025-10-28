@@ -3,6 +3,7 @@
 # Description: Voice chat screen integrating Gemini Live API with audio playback.
 
 import asyncio
+import os
 import queue
 import re
 import threading
@@ -31,7 +32,7 @@ LabelBase.register(
 
 Builder.load_file('Assets/Screens/VoiceTest/VoiceTestScreen.kv')
 
-GEMINI_API_KEY = "AIzaSyBC0-gE_aSsMXNL0fvFApzijUkEPRC8wSc"
+GEMINI_API_KEY_ENV = 'AIzaSyBC0-gE_aSsMXNL0fvFApzijUkEPRC8wSc' 
 MODEL_NAME = "models/gemini-2.0-flash-live-001"
 CONNECTION_POLL_INTERVAL = 0.1
 SPEECH_QUEUE_MAXSIZE = 5
@@ -42,6 +43,16 @@ DSP_SAMPLE_RATE = 22050
 AUDIO_FORMAT = pyaudio.paInt16
 AUDIO_CHANNELS = 1
 DEFAULT_SYSTEM_PROMPT = "あなたは優秀な英語AIアシスタントです。"
+
+
+def load_gemini_api_key() -> str:
+    """Read and validate the Gemini API key from the environment variable."""
+    api_key = os.getenv(GEMINI_API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError(
+            f"Environment variable {GEMINI_API_KEY_ENV} must be set to use the voice test screen."
+        )
+    return api_key
 
 
 def build_live_connect_config() -> types.LiveConnectConfig:
@@ -58,7 +69,7 @@ def create_genai_client(api_key: str) -> genai.Client:
     """Instantiate a Gemini client for the asynchronous live session APIs.
 
     Args:
-        api_key: Gemini authentication token string.
+        api_key: Gemini authentication token obtained from the environment.
     """
     return genai.Client(http_options={"api_version": "v1beta"}, api_key=api_key)
 
@@ -79,17 +90,13 @@ class VoiceTestScreen(Screen):
         self._speech_worker: Optional[threading.Thread] = None
         self._speech_stop_event: Optional[threading.Event] = None
         self._audio_interface: Optional[pyaudio.PyAudio] = None
-        self._client: Optional[genai.Client] = None
+        self._client = create_genai_client(load_gemini_api_key())
         self._live_config = build_live_connect_config()
-        self._initialization_error: Optional[str] = None
 
     def on_enter(self):
         """Start background workers and connect to Gemini when the screen appears."""
         print("VoiceTest Screen Entered!")
         self.ids.apiResponse.text = "Connecting..."
-        if not self._ensure_client():
-            self.ids.apiResponse.text = self._initialization_error or "Gemini クライアントの初期化に失敗しました。"
-            return
         self._start_speech_worker()
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(
@@ -108,19 +115,16 @@ class VoiceTestScreen(Screen):
 
     async def run_audio_loop(self):
         """Maintain the Gemini Live connection and coordinate message handling."""
-        if not self._client:
-            return
-        receiver_task: Optional[asyncio.Task] = None
         try:
-            async with self._client.aio.live.connect(
-                model=MODEL_NAME,
-                config=self._live_config,
-            ) as session:
+            async with (
+                self._client.aio.live.connect(model=MODEL_NAME, config=self._live_config) as session,
+                asyncio.TaskGroup() as task_group,
+            ):
                 self.session = session
                 self.audio_in_queue = asyncio.Queue()
                 self.out_queue = asyncio.Queue(maxsize=SPEECH_QUEUE_MAXSIZE)
                 self.running = True
-                receiver_task = asyncio.create_task(self.receive_text())
+                task_group.create_task(self.receive_text())
                 Clock.schedule_once(lambda dt: setattr(self.ids.apiResponse, "text", "Connected"))
                 while self.running:
                     await asyncio.sleep(CONNECTION_POLL_INTERVAL)
@@ -132,19 +136,10 @@ class VoiceTestScreen(Screen):
         finally:
             self.running = False
             self.session = None
-            if receiver_task is not None:
-                receiver_task.cancel()
-                try:
-                    await receiver_task
-                except asyncio.CancelledError:
-                    pass
             Clock.schedule_once(lambda dt: setattr(self.ids.apiResponse, "text", "Disconnect"))
 
     def send_text(self):
         """Dispatch user input from the UI to Gemini asynchronously."""
-        if self._initialization_error:
-            print(self._initialization_error)
-            return
         if not self.session or not self.loop:
             print("セッション未接続またはループ未初期化")
             return
@@ -416,15 +411,3 @@ class VoiceTestScreen(Screen):
                 pass
         self.loop = None
         self.loop_thread = None
-
-    def _ensure_client(self) -> bool:
-        """Create the Gemini client using the embedded API key."""
-        if self._client is not None:
-            return True
-        try:
-            self._client = create_genai_client(GEMINI_API_KEY)
-            self._initialization_error = None
-            return True
-        except Exception as error:
-            self._initialization_error = f"Gemini クライアントの初期化に失敗しました: {error}"
-        return False
