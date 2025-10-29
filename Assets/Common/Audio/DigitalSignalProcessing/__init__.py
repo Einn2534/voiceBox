@@ -25,7 +25,7 @@ from .synthesis import (
     synth_vowel,
     synth_vowel_with_onset,
 )
-from .text import text_to_tokens
+from .text import normalize_token_sequence, text_to_tokens
 from .io import write_wav
 
 __all__ = [
@@ -39,6 +39,7 @@ __all__ = [
     "NasalCoupling",
     "SpeakerProfile",
     "text_to_tokens",
+    "normalize_token_sequence",
     "synth_vowel",
     "synth_fricative",
     "synth_plosive",

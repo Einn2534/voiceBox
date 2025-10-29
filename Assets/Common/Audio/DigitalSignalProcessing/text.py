@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import unicodedata
-from typing import List
+from typing import Any, Iterable, List, Optional
+
+import numpy as np
 
 from .constants import (
     CV_TOKEN_MAP,
@@ -18,7 +20,7 @@ from .constants import (
     _VOICED_KANA_MAP,
 )
 
-__all__ = ["text_to_tokens"]
+__all__ = ["text_to_tokens", "normalize_token_sequence"]
 
 
 def _normalize_to_hiragana(text: str) -> str:
@@ -166,3 +168,31 @@ def text_to_tokens(text: str) -> List[str]:
     if out and out[-1] == PAUSE_TOKEN:
         out = out[:-1]
     return out
+
+
+def normalize_token_sequence(tokens: Optional[Any]) -> List[str]:
+    """Normalise arbitrary token containers into a flat list of strings.
+
+    Args:
+        tokens (Optional[Any]): Token-like sequence returned from synthesis helpers.
+
+    Returns:
+        List[str]: Flat list of tokens suitable for downstream processing.
+    """
+    if tokens is None:
+        return []
+    if isinstance(tokens, list):
+        return [str(token) for token in tokens]
+    if isinstance(tokens, np.ndarray):
+        flat_tokens = tokens.ravel().tolist()
+        return [str(token) for token in flat_tokens]
+    if isinstance(tokens, tuple):
+        return [str(token) for token in tokens]
+    if isinstance(tokens, str):
+        return [tokens]
+
+    try:
+        iterable: Iterable[Any] = list(tokens)
+    except TypeError:
+        return [str(tokens)]
+    return [str(token) for token in iterable]
