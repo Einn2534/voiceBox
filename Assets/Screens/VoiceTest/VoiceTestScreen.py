@@ -170,8 +170,9 @@ class VoiceTestScreen(Screen):
         if not self.session:
             return
         try:
-            while self.running and self.session:
-                turn = await self.session.receive()
+            async for turn in self.session.receive():
+                if not self.running or not self.session:
+                    break
                 full_text = ""
                 async for response in turn:
                     if response.text:
