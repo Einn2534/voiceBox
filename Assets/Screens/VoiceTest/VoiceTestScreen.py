@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import queue
@@ -41,6 +42,9 @@ LabelBase.register(
 Builder.load_file("Assets/Screens/VoiceTest/VoiceTestScreen.kv")
 
 DEFAULT_SYSTEM_INSTRUCTION = "あなたは優秀な英語AIアシスタントです。"
+CONFIG_FILE_NAME = "GeminiSettings.json"
+CONFIG_FILE_ENCODING = "utf-8"
+CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), CONFIG_FILE_NAME)
 PHRASE_INTERVAL_SECONDS = 0.12
 MAX_PHRASE_LENGTH = 60
 
@@ -70,7 +74,7 @@ class GeminiSettings:
         """Create a Gemini client using the configured API key."""
         if not self.api_key:
             raise RuntimeError(
-                "GEMINI_API_KEY is not configured. Set the environment variable before launching the screen."
+                "Gemini設定ファイルにapiKeyが未設定です。"
             )
         return genai.Client(
             http_options={"api_version": self.api_version},
@@ -86,14 +90,47 @@ class GeminiSettings:
             response_modalities=["text"],
         )
 
+    @classmethod
+    def from_file(cls, path: str) -> "GeminiSettings":
+        """Build settings from a JSON configuration file.
+
+        Args:
+            path (str): Absolute path to the configuration JSON file.
+
+        Returns:
+            GeminiSettings: Parsed settings instance built from the file content.
+        """
+        try:
+            with open(path, "r", encoding=CONFIG_FILE_ENCODING) as config_file:
+                data = json.load(config_file)
+        except FileNotFoundError as error:
+            raise RuntimeError(f"Gemini設定ファイルが見つかりません: {path}") from error
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Gemini設定ファイルの形式が不正です: {path}") from error
+
+        model = str(data.get("model", "")).strip()
+        api_key = str(data.get("apiKey", "")).strip()
+        instruction = str(
+            data.get("systemInstruction", DEFAULT_SYSTEM_INSTRUCTION)
+        ).strip()
+
+        if not model:
+            raise RuntimeError("Gemini設定ファイルにmodelが定義されていません。")
+        if not api_key:
+            raise RuntimeError("Gemini設定ファイルにapiKeyが定義されていません。")
+        if not instruction:
+            instruction = DEFAULT_SYSTEM_INSTRUCTION
+
+        return cls(model=model, system_instruction=instruction, api_key=api_key)
+
 
 def load_gemini_settings() -> GeminiSettings:
-    """Load Gemini configuration from the environment."""
-    return GeminiSettings(
-        model="models/gemini-2.0-flash-live-001",
-        system_instruction=DEFAULT_SYSTEM_INSTRUCTION,
-        api_key=os.getenv("GEMINI_API_KEY", "").strip(),
-    )
+    """Load Gemini configuration from the VoiceTest settings file.
+
+    Returns:
+        GeminiSettings: Settings loaded from the configuration JSON file.
+    """
+    return GeminiSettings.from_file(CONFIG_FILE_PATH)
 
 
 AUDIO_SETTINGS = AudioSettings()

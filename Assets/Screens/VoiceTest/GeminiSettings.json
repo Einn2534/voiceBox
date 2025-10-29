@@ -1,0 +1,5 @@
+{
+    "model": "models/gemini-2.0-flash-live-001",
+    "systemInstruction": "あなたは優秀な英語AIアシスタントです。",
+    "apiKey": "REPLACE_WITH_YOUR_GEMINI_API_KEY"
+}
