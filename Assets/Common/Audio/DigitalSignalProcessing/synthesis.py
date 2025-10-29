@@ -1,7 +1,9 @@
+# Created on 2024-06-08
+# Created by ChatGPT
 """High-level synthesis routines built on the DSP helpers."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -47,7 +49,29 @@ from .filters import (
 from .io import write_wav
 from .sources import _gen_band_noise, _glottal_source
 
+@dataclass(frozen=True)
+class TokenProsody:
+    """Container for per-token prosodic overrides used during synthesis."""
+
+    f0: Optional[float] = None
+    vowelMilliseconds: Optional[float] = None
+    consonantMilliseconds: Optional[float] = None
+    preMilliseconds: Optional[float] = None
+    overlapMilliseconds: Optional[float] = None
+    gapMilliseconds: Optional[float] = None
+    durationScale: Optional[float] = None
+
+
+_MIN_VOWEL_DURATION_MS = 120.0
+_MIN_SCALED_VOWEL_MS = 40.0
+_MIN_NASAL_DURATION_MS = 80.0
+_NASAL_DURATION_RATIO = 0.6
+_PAUSE_MULTIPLIER = 3.0
+_MIN_PAUSE_DURATION_MS = 120.0
+
+
 __all__ = [
+    "TokenProsody",
     "synth_vowel",
     "synth_fricative",
     "synth_plosive",
@@ -790,11 +814,26 @@ def synth_token_sequence(
     useOnsetTransition: bool = False,
     vowelModel: Optional[Dict[str, Any]] = None,
     speakerProfile: Optional[SpeakerProfile] = None,
+    tokenProsody: Optional[Sequence[Optional[TokenProsody]]] = None,
 ) -> np.ndarray:
+    """Synthesize a token sequence with optional per-token prosody overrides.
+
+    Args:
+        tokens: Phonetic tokens to synthesize.
+        f0: Baseline pitch in Hertz.
+        sampleRate: Target sampling rate.
+        vowelMilliseconds: Default vowel duration in milliseconds.
+        overlapMilliseconds: Default consonant-vowel overlap in milliseconds.
+        gapMilliseconds: Default silence inserted between tokens in milliseconds.
+        useOnsetTransition: Whether to synthesize vowel onsets explicitly.
+        vowelModel: Optional vowel synthesis overrides.
+        speakerProfile: Speaker profile used for nasal coupling and timbre.
+        tokenProsody: Optional overrides for pitch and timing per token index.
+    """
+
     segs: List[np.ndarray] = []
-    gap = _ms_to_samples(max(0, int(gapMilliseconds)), sampleRate)
-    vow_sec = max(0.12, float(vowelMilliseconds) / 1000.0)
-    nasal_ms = max(80, int(vowelMilliseconds * 0.6))
+    default_gap_ms = max(0.0, float(gapMilliseconds))
+    default_vowel_ms = max(_MIN_VOWEL_DURATION_MS, float(vowelMilliseconds))
 
     vowel_kwargs = dict(vowelModel or {})
     if speakerProfile is not None:
@@ -802,39 +841,89 @@ def synth_token_sequence(
     speaker_profile: Optional[SpeakerProfile] = vowel_kwargs.get('speakerProfile')
     nasal_coupling = speaker_profile.nasal_coupling if speaker_profile is not None else None
 
-    for tok in tokens:
+    for idx, tok in enumerate(tokens):
         t = tok.strip().lower()
         if not t:
             continue
+
+        prosody = None
+        if tokenProsody is not None and idx < len(tokenProsody):
+            prosody = tokenProsody[idx]
+
+        token_f0 = float(f0) if prosody is None or prosody.f0 is None else float(prosody.f0)
+
+        token_vowel_ms = default_vowel_ms
+        if prosody is not None and prosody.vowelMilliseconds is not None:
+            token_vowel_ms = max(_MIN_SCALED_VOWEL_MS, float(prosody.vowelMilliseconds))
+        elif prosody is not None and prosody.durationScale is not None:
+            token_vowel_ms = max(
+                _MIN_SCALED_VOWEL_MS,
+                default_vowel_ms * max(0.05, float(prosody.durationScale)),
+            )
+
+        token_overlap_ms = int(overlapMilliseconds)
+        if prosody is not None and prosody.overlapMilliseconds is not None:
+            token_overlap_ms = max(0, int(prosody.overlapMilliseconds))
+
+        token_gap_ms = default_gap_ms
+        if prosody is not None and prosody.gapMilliseconds is not None:
+            token_gap_ms = max(0.0, float(prosody.gapMilliseconds))
+        elif prosody is not None and prosody.durationScale is not None:
+            token_gap_ms = max(0.0, default_gap_ms * max(0.0, float(prosody.durationScale)))
+
+        token_gap_samples = _ms_to_samples(int(token_gap_ms), sampleRate)
+
         if t == PAUSE_TOKEN:
-            pause_ms = max(gapMilliseconds * 3, 120)
-            segs.append(np.zeros(_ms_to_samples(pause_ms, sampleRate), dtype=DTYPE))
+            pause_ms = max(default_gap_ms * _PAUSE_MULTIPLIER, _MIN_PAUSE_DURATION_MS)
+            if prosody is not None:
+                if prosody.vowelMilliseconds is not None:
+                    pause_ms = max(0.0, float(prosody.vowelMilliseconds))
+                elif prosody.durationScale is not None and prosody.gapMilliseconds is None:
+                    pause_ms = max(
+                        0.0,
+                        pause_ms * max(0.0, float(prosody.durationScale)),
+                    )
+                elif prosody.gapMilliseconds is not None:
+                    pause_ms = max(0.0, float(prosody.gapMilliseconds))
+            segs.append(np.zeros(_ms_to_samples(int(pause_ms), sampleRate), dtype=DTYPE))
             continue
+
         if t in CV_TOKEN_MAP:
             ck, vk = CV_TOKEN_MAP[t]
-            seg = synth_cv(
-                ck,
-                vk,
-                f0=f0,
-                sampleRate=sampleRate,
-                vowelMilliseconds=vowelMilliseconds,
-                overlapMilliseconds=overlapMilliseconds,
-                useOnsetTransition=useOnsetTransition,
-                vowelModel=vowel_kwargs,
-                speakerProfile=speaker_profile,
-            )
+            cv_kwargs: Dict[str, Any] = {
+                'f0': token_f0,
+                'sampleRate': sampleRate,
+                'vowelMilliseconds': int(token_vowel_ms),
+                'overlapMilliseconds': token_overlap_ms,
+                'useOnsetTransition': useOnsetTransition,
+                'vowelModel': vowel_kwargs,
+                'speakerProfile': speaker_profile,
+            }
+            if prosody is not None and prosody.preMilliseconds is not None:
+                cv_kwargs['preMilliseconds'] = max(0, int(prosody.preMilliseconds))
+            if prosody is not None and prosody.consonantMilliseconds is not None:
+                cv_kwargs['consonantMilliseconds'] = max(0, int(prosody.consonantMilliseconds))
+            seg = synth_cv(ck, vk, **cv_kwargs)
+
         elif t in VOWEL_TABLE:
             seg = synth_vowel(
                 t,
-                f0=f0,
-                durationSeconds=vow_sec,
+                f0=token_f0,
+                durationSeconds=max(_MIN_SCALED_VOWEL_MS, token_vowel_ms) / 1000.0,
                 sampleRate=sampleRate,
                 **vowel_kwargs,
             )
+
         elif t in NASAL_TOKEN_MAP:
+            nasal_ms = max(
+                _MIN_NASAL_DURATION_MS,
+                int(token_vowel_ms * _NASAL_DURATION_RATIO),
+            )
+            if prosody is not None and prosody.consonantMilliseconds is not None:
+                nasal_ms = max(_MIN_NASAL_DURATION_MS, int(prosody.consonantMilliseconds))
             seg = synth_nasal(
                 NASAL_TOKEN_MAP[t],
-                f0=f0,
+                f0=token_f0,
                 durationMilliseconds=nasal_ms,
                 sampleRate=sampleRate,
                 nasalCoupling=nasal_coupling,
@@ -843,12 +932,13 @@ def synth_token_sequence(
         else:
             raise ValueError(f"Unsupported token '{tok}' for synthesis")
 
-        if segs and gap > 0:
-            segs.append(np.zeros(gap, dtype=DTYPE))
+        if segs and token_gap_samples > 0:
+            segs.append(np.zeros(token_gap_samples, dtype=DTYPE))
+
         segs.append(seg.astype(DTYPE, copy=False))
 
     if not segs:
-        return np.zeros(_ms_to_samples(120, sampleRate), dtype=DTYPE)
+        return np.zeros(_ms_to_samples(int(_MIN_PAUSE_DURATION_MS), sampleRate), dtype=DTYPE)
 
     y = np.concatenate(segs).astype(DTYPE, copy=False)
     return _normalize_peak(y, PEAK_DEFAULT)
@@ -866,7 +956,24 @@ def synth_tokens_to_wav(
     useOnsetTransition: bool = False,
     vowelModel: Optional[Dict[str, Any]] = None,
     speakerProfile: Optional[SpeakerProfile] = None,
+    tokenProsody: Optional[Sequence[Optional[TokenProsody]]] = None,
 ) -> str:
+    """Render a token sequence to disk while allowing per-token prosody overrides.
+
+    Args:
+        tokens: Phonetic tokens to synthesize.
+        outPath: Output WAV file path.
+        f0: Baseline pitch in Hertz.
+        sampleRate: Target sampling rate.
+        vowelMilliseconds: Default vowel duration in milliseconds.
+        overlapMilliseconds: Default consonant-vowel overlap in milliseconds.
+        gapMilliseconds: Default silence inserted between tokens in milliseconds.
+        useOnsetTransition: Whether to synthesize vowel onsets explicitly.
+        vowelModel: Optional vowel synthesis overrides.
+        speakerProfile: Speaker profile used for nasal coupling and timbre.
+        tokenProsody: Optional overrides for pitch and timing per token index.
+    """
+
     y = synth_token_sequence(
         tokens,
         f0=f0,
@@ -877,5 +984,6 @@ def synth_tokens_to_wav(
         useOnsetTransition=useOnsetTransition,
         vowelModel=vowelModel,
         speakerProfile=speakerProfile,
+        tokenProsody=tokenProsody,
     )
     return write_wav(outPath, y, sampleRate=sampleRate)
