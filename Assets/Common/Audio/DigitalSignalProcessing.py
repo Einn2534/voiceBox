@@ -25,6 +25,8 @@ DEFAULT_SPEED_OF_SOUND_CM_S = 34300.0
 DEFAULT_LIP_RADIUS_CM = 0.9
 LIP_END_CORRECTION_FACTOR = 0.6
 DEFAULT_FORMANT_COUNT = 3
+FORMANT_KEY = 'F'
+BANDWIDTH_KEY = 'BW'
 
 
 # =======================
@@ -42,7 +44,11 @@ class TubeDesign:
     formant_count: int = DEFAULT_FORMANT_COUNT
 
     def compute_formants(self) -> List[float]:
-        """Return the baseline 1/4 wave resonances in Hz."""
+        """Return the baseline 1/4 wave resonances in Hz.
+
+        Returns:
+            List[float]: Quarter-wave resonant frequencies ordered by mode.
+        """
         effective_length = self.length_cm + LIP_END_CORRECTION_FACTOR * self.lip_radius_cm
         return [
             (2 * index - 1) * self.speed_of_sound_cm_s / (4.0 * effective_length)
@@ -84,7 +90,12 @@ def _apply_constriction_perturbation(
     frequencies: List[float],
     constriction: ConstrictionSpec,
 ) -> None:
-    """Apply the perturbation contributed by a single constriction."""
+    """Apply the perturbation contributed by a single constriction.
+
+    Args:
+        frequencies (List[float]): Formant frequency list to update in place.
+        constriction (ConstrictionSpec): Constriction parameters applied to the tube.
+    """
 
     position = constriction.clamped_position()
     focus = list(constriction.focus) if constriction.focus else None
@@ -108,7 +119,17 @@ def compute_quarter_wave_formants(
     speed_of_sound_cm_s: float = DEFAULT_SPEED_OF_SOUND_CM_S,
     formant_count: int = DEFAULT_FORMANT_COUNT,
 ) -> List[float]:
-    """Utility wrapper that returns 1/4 wave formants for ad-hoc usage."""
+    """Return quarter-wave formants for a simple tube configuration.
+
+    Args:
+        length_cm (float): Physical length of the vocal-tract tube in centimetres.
+        lip_radius_cm (float): Lip radius used for end correction.
+        speed_of_sound_cm_s (float): Propagation speed of sound in cm/s.
+        formant_count (int): Number of formant frequencies to generate.
+
+    Returns:
+        List[float]: Computed baseline formants in Hz.
+    """
 
     design = TubeDesign(
         length_cm=length_cm,
@@ -122,26 +143,48 @@ def compute_quarter_wave_formants(
 def build_vowel_table(
     specs: Dict[str, VowelDesignSpec],
 ) -> Dict[str, Dict[str, Sequence[float]]]:
-    """Materialise a vowel table from design specifications."""
+    """Materialise a vowel table from design specifications.
+
+    Args:
+        specs (Dict[str, VowelDesignSpec]): Mapping from vowel symbols to designs.
+
+    Returns:
+        Dict[str, Dict[str, Sequence[float]]]: Runtime lookup table with
+            frequency and bandwidth sequences.
+    """
 
     table: Dict[str, Dict[str, Sequence[float]]] = {}
     for vowel, spec in specs.items():
-        table[vowel] = {'F': spec.compute_formants(), 'BW': list(spec.bandwidths)}
+        table[vowel] = {
+            FORMANT_KEY: spec.compute_formants(),
+            BANDWIDTH_KEY: list(spec.bandwidths),
+        }
     return table
 
 
 def register_vowel_design(spec: VowelDesignSpec) -> None:
-    """Add or replace a vowel design and refresh the global formant table."""
+    """Add or replace a vowel design and refresh the global formant table.
+
+    Args:
+        spec (VowelDesignSpec): Declarative vowel design definition to store.
+    """
 
     DEFAULT_VOWEL_LIBRARY[spec.vowel] = spec
     VOWEL_TABLE[spec.vowel] = {
-        'F': spec.compute_formants(),
-        'BW': list(spec.bandwidths),
+        FORMANT_KEY: spec.compute_formants(),
+        BANDWIDTH_KEY: list(spec.bandwidths),
     }
 
 
 def get_vowel_design(vowel: str) -> VowelDesignSpec:
-    """Retrieve the declarative design spec for a vowel symbol."""
+    """Retrieve the declarative design spec for a vowel symbol.
+
+    Args:
+        vowel (str): Symbol key registered in the vowel library.
+
+    Returns:
+        VowelDesignSpec: Stored design specification.
+    """
 
     if vowel not in DEFAULT_VOWEL_LIBRARY:
         raise KeyError(f'Unknown vowel design requested: {vowel}')
@@ -153,6 +196,17 @@ def rebuild_vowel_table() -> None:
 
     VOWEL_TABLE.clear()
     VOWEL_TABLE.update(build_vowel_table(DEFAULT_VOWEL_LIBRARY))
+
+
+def list_registered_vowels() -> Tuple[str, ...]:
+    """Return the registered vowel symbols ordered alphabetically.
+
+    Returns:
+        Tuple[str, ...]: Sorted tuple of vowel identifiers available in the
+            current vowel table.
+    """
+
+    return tuple(sorted(VOWEL_TABLE))
 
 
 # ---- 母音プリセット（成人中性声の目安） ----
@@ -684,7 +738,7 @@ def synth_vowel(
     assert vowel in VOWEL_TABLE, f"unsupported vowel: {vowel}"
     src = _glottal_source(f0, durationSeconds, sampleRate, jitterCents, shimmerDb)
     spec = VOWEL_TABLE[vowel]
-    y = _apply_formant_filters(src, spec['F'], spec['BW'], sampleRate)
+    y = _apply_formant_filters(src, spec[FORMANT_KEY], spec[BANDWIDTH_KEY], sampleRate)
     y = _add_breath_noise(y, breathLevelDb)
     return _normalize_peak(y, PEAK_DEFAULT)
 
@@ -829,7 +883,7 @@ def synth_vowel_with_onset(
 ) -> np.ndarray:
     """母音先頭だけフォルマント遷移を与える簡易版"""
     spec = VOWEL_TABLE[vowel]
-    targetF, targetBW = spec['F'], spec['BW']
+    targetF, targetBW = spec[FORMANT_KEY], spec[BANDWIDTH_KEY]
     if not onsetFormants:
         return synth_vowel(vowel=vowel, f0=f0, durationSeconds=totalMilliseconds / 1000.0, sampleRate=sampleRate)
 
@@ -919,8 +973,8 @@ def synth_affricate(
 
 
 NASAL_PRESETS: Dict[str, Dict[str, Sequence[float]]] = {
-    'n': {'F': [250.0, 1900.0, 2800.0], 'BW': [80.0, 160.0, 220.0]},
-    'm': {'F': [220.0, 1600.0, 2500.0], 'BW': [70.0, 150.0, 210.0]},
+    'n': {FORMANT_KEY: [250.0, 1900.0, 2800.0], BANDWIDTH_KEY: [80.0, 160.0, 220.0]},
+    'm': {FORMANT_KEY: [220.0, 1600.0, 2500.0], BANDWIDTH_KEY: [70.0, 150.0, 210.0]},
 }
 
 
@@ -937,7 +991,7 @@ def synth_nasal(
 
     dur_s = max(20.0, float(durationMilliseconds)) / 1000.0
     spec = NASAL_PRESETS[c]
-    y = _synth_vowel_fixed(spec['F'], spec['BW'], f0, dur_s, sampleRate,
+    y = _synth_vowel_fixed(spec[FORMANT_KEY], spec[BANDWIDTH_KEY], f0, dur_s, sampleRate,
                            jitterCents=4.0, shimmerDb=0.4, breathLevelDb=-38.0)
     y = _apply_fade(y, sampleRate,
                     attack_ms=8.0 if c == 'n' else 10.0,
