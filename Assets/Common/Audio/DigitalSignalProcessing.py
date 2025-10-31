@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import wave
 import unicodedata
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -19,20 +20,166 @@ from math import pi, sin, cos, exp
 DTYPE = np.float32
 PEAK_DEFAULT = 0.9
 EPS = 1e-12
+MAX_FORMANT_PERTURBATION = 0.65
 
 
 # =======================
-# Vowel / Token Tables
+# Vowel design helpers
 # =======================
+
+
+@dataclass(frozen=True)
+class TubeDesign:
+    """Quarter-wave tube model approximating the vocal tract."""
+
+    length_cm: float
+    lip_radius_cm: float = 0.9
+    speed_of_sound_cm_s: float = 34300.0
+    formant_count: int = 3
+
+    def compute_formants(self) -> List[float]:
+        """Return the baseline 1/4 wave resonances in Hz."""
+        effective_length = self.length_cm + 0.6 * self.lip_radius_cm
+        return [
+            (2 * index - 1) * self.speed_of_sound_cm_s / (4.0 * effective_length)
+            for index in range(1, self.formant_count + 1)
+        ]
+
+
+@dataclass(frozen=True)
+class ConstrictionSpec:
+    """Perturbation description for a localised constriction."""
+
+    position_ratio: float
+    intensity: float
+    focus: Optional[Sequence[float]] = None
+
+    def clamped_position(self) -> float:
+        """Clamp the constriction position inside [0, 1]."""
+        return float(max(0.0, min(1.0, self.position_ratio)))
+
+
+@dataclass(frozen=True)
+class VowelDesignSpec:
+    """Declarative formant design based on tube length and constrictions."""
+
+    vowel: str
+    tube: TubeDesign
+    constrictions: Sequence[ConstrictionSpec]
+    bandwidths: Sequence[float]
+
+    def compute_formants(self) -> List[float]:
+        """Calculate perturbed formant frequencies for the vowel."""
+        frequencies = list(self.tube.compute_formants())
+        for constriction in self.constrictions:
+            _apply_constriction_perturbation(frequencies, constriction)
+        return [float(freq) for freq in frequencies]
+
+
+def _apply_constriction_perturbation(
+    frequencies: List[float],
+    constriction: ConstrictionSpec,
+) -> None:
+    """Apply the perturbation contributed by a single constriction."""
+
+    position = constriction.clamped_position()
+    focus = list(constriction.focus) if constriction.focus else None
+    for index, base_freq in enumerate(frequencies):
+        mode = index + 1
+        angle = (2 * mode - 1) * pi * position / 2.0
+        velocity = sin(angle)
+        weight = 1.0 - 2.0 * velocity * velocity
+        weight = max(-1.0, min(1.0, weight))
+        if focus and index < len(focus):
+            weight *= float(focus[index])
+        delta = constriction.intensity * weight
+        delta = max(-MAX_FORMANT_PERTURBATION, min(MAX_FORMANT_PERTURBATION, delta))
+        frequencies[index] = base_freq * (1.0 + delta)
+
+
+def compute_quarter_wave_formants(
+    length_cm: float,
+    *,
+    lip_radius_cm: float = 0.9,
+    speed_of_sound_cm_s: float = 34300.0,
+    formant_count: int = 3,
+) -> List[float]:
+    """Utility wrapper that returns 1/4 wave formants for ad-hoc usage."""
+
+    design = TubeDesign(
+        length_cm=length_cm,
+        lip_radius_cm=lip_radius_cm,
+        speed_of_sound_cm_s=speed_of_sound_cm_s,
+        formant_count=formant_count,
+    )
+    return design.compute_formants()
+
+
+def build_vowel_table(
+    specs: Dict[str, VowelDesignSpec],
+) -> Dict[str, Dict[str, Sequence[float]]]:
+    """Materialise a vowel table from design specifications."""
+
+    table: Dict[str, Dict[str, Sequence[float]]] = {}
+    for vowel, spec in specs.items():
+        table[vowel] = {'F': spec.compute_formants(), 'BW': list(spec.bandwidths)}
+    return table
+
 
 # ---- 母音プリセット（成人中性声の目安） ----
-VOWEL_TABLE: Dict[str, Dict[str, Sequence[float]]] = {
-    'a': {'F': [800, 1150, 2900], 'BW': [90, 110, 150]},
-    'i': {'F': [350, 2000, 3000], 'BW': [60, 100, 150]},
-    'u': {'F': [325, 700, 2530],  'BW': [60, 90, 140]},
-    'e': {'F': [400, 1700, 2600], 'BW': [70, 100, 150]},
-    'o': {'F': [450, 800, 2830],  'BW': [80, 110, 150]},
+DEFAULT_VOWEL_LIBRARY: Dict[str, VowelDesignSpec] = {
+    'a': VowelDesignSpec(
+        vowel='a',
+        tube=TubeDesign(length_cm=14.5),
+        constrictions=(
+            ConstrictionSpec(0.2, 0.42, (1.3, 0.6, 0.2)),
+            ConstrictionSpec(0.45, 0.36, (0.0, 1.55, 0.45)),
+        ),
+        bandwidths=(90.0, 110.0, 150.0),
+    ),
+    'i': VowelDesignSpec(
+        vowel='i',
+        tube=TubeDesign(length_cm=17.5),
+        constrictions=(
+            ConstrictionSpec(0.71, 0.435, None),
+            ConstrictionSpec(0.38, 0.22, (0.0, 0.0, 1.2)),
+        ),
+        bandwidths=(60.0, 100.0, 150.0),
+    ),
+    'u': VowelDesignSpec(
+        vowel='u',
+        tube=TubeDesign(length_cm=28.0),
+        constrictions=(
+            ConstrictionSpec(0.8, -0.6, (0.45, 1.1, 0.3)),
+            ConstrictionSpec(0.15, -0.12, (1.0, 0.8, 0.6)),
+            ConstrictionSpec(0.38, 0.5, (0.0, 0.0, 1.5)),
+            ConstrictionSpec(0.32, 0.45, (0.0, 0.0, 1.4)),
+        ),
+        bandwidths=(60.0, 90.0, 140.0),
+    ),
+    'e': VowelDesignSpec(
+        vowel='e',
+        tube=TubeDesign(length_cm=19.0),
+        constrictions=(
+            ConstrictionSpec(0.6, 0.28, (0.5, 1.2, 0.45)),
+            ConstrictionSpec(0.38, 0.26, (0.0, 0.0, 1.4)),
+        ),
+        bandwidths=(70.0, 100.0, 150.0),
+    ),
+    'o': VowelDesignSpec(
+        vowel='o',
+        tube=TubeDesign(length_cm=21.0),
+        constrictions=(
+            ConstrictionSpec(0.35, 0.18, (1.0, 0.6, 0.3)),
+            ConstrictionSpec(0.74, -0.32, (0.45, 1.05, 0.3)),
+            ConstrictionSpec(0.38, 0.22, (0.0, 0.0, 1.35)),
+            ConstrictionSpec(0.42, 0.12, (0.0, 0.0, 1.1)),
+        ),
+        bandwidths=(80.0, 110.0, 150.0),
+    ),
 }
+
+VOWEL_TABLE: Dict[str, Dict[str, Sequence[float]]] = build_vowel_table(DEFAULT_VOWEL_LIBRARY)
 
 # ローマ字トークン → (子音, 母音)
 CV_TOKEN_MAP: Dict[str, Tuple[str, str]] = {
