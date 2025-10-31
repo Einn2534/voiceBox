@@ -21,6 +21,10 @@ DTYPE = np.float32
 PEAK_DEFAULT = 0.9
 EPS = 1e-12
 MAX_FORMANT_PERTURBATION = 0.65
+DEFAULT_SPEED_OF_SOUND_CM_S = 34300.0
+DEFAULT_LIP_RADIUS_CM = 0.9
+LIP_END_CORRECTION_FACTOR = 0.6
+DEFAULT_FORMANT_COUNT = 3
 
 
 # =======================
@@ -33,13 +37,13 @@ class TubeDesign:
     """Quarter-wave tube model approximating the vocal tract."""
 
     length_cm: float
-    lip_radius_cm: float = 0.9
-    speed_of_sound_cm_s: float = 34300.0
-    formant_count: int = 3
+    lip_radius_cm: float = DEFAULT_LIP_RADIUS_CM
+    speed_of_sound_cm_s: float = DEFAULT_SPEED_OF_SOUND_CM_S
+    formant_count: int = DEFAULT_FORMANT_COUNT
 
     def compute_formants(self) -> List[float]:
         """Return the baseline 1/4 wave resonances in Hz."""
-        effective_length = self.length_cm + 0.6 * self.lip_radius_cm
+        effective_length = self.length_cm + LIP_END_CORRECTION_FACTOR * self.lip_radius_cm
         return [
             (2 * index - 1) * self.speed_of_sound_cm_s / (4.0 * effective_length)
             for index in range(1, self.formant_count + 1)
@@ -100,9 +104,9 @@ def _apply_constriction_perturbation(
 def compute_quarter_wave_formants(
     length_cm: float,
     *,
-    lip_radius_cm: float = 0.9,
-    speed_of_sound_cm_s: float = 34300.0,
-    formant_count: int = 3,
+    lip_radius_cm: float = DEFAULT_LIP_RADIUS_CM,
+    speed_of_sound_cm_s: float = DEFAULT_SPEED_OF_SOUND_CM_S,
+    formant_count: int = DEFAULT_FORMANT_COUNT,
 ) -> List[float]:
     """Utility wrapper that returns 1/4 wave formants for ad-hoc usage."""
 
@@ -124,6 +128,31 @@ def build_vowel_table(
     for vowel, spec in specs.items():
         table[vowel] = {'F': spec.compute_formants(), 'BW': list(spec.bandwidths)}
     return table
+
+
+def register_vowel_design(spec: VowelDesignSpec) -> None:
+    """Add or replace a vowel design and refresh the global formant table."""
+
+    DEFAULT_VOWEL_LIBRARY[spec.vowel] = spec
+    VOWEL_TABLE[spec.vowel] = {
+        'F': spec.compute_formants(),
+        'BW': list(spec.bandwidths),
+    }
+
+
+def get_vowel_design(vowel: str) -> VowelDesignSpec:
+    """Retrieve the declarative design spec for a vowel symbol."""
+
+    if vowel not in DEFAULT_VOWEL_LIBRARY:
+        raise KeyError(f'Unknown vowel design requested: {vowel}')
+    return DEFAULT_VOWEL_LIBRARY[vowel]
+
+
+def rebuild_vowel_table() -> None:
+    """Recompute the global formant lookup from the registered designs."""
+
+    VOWEL_TABLE.clear()
+    VOWEL_TABLE.update(build_vowel_table(DEFAULT_VOWEL_LIBRARY))
 
 
 # ---- 母音プリセット（成人中性声の目安） ----
@@ -179,7 +208,8 @@ DEFAULT_VOWEL_LIBRARY: Dict[str, VowelDesignSpec] = {
     ),
 }
 
-VOWEL_TABLE: Dict[str, Dict[str, Sequence[float]]] = build_vowel_table(DEFAULT_VOWEL_LIBRARY)
+VOWEL_TABLE: Dict[str, Dict[str, Sequence[float]]] = {}
+rebuild_vowel_table()
 
 # ローマ字トークン → (子音, 母音)
 CV_TOKEN_MAP: Dict[str, Tuple[str, str]] = {
