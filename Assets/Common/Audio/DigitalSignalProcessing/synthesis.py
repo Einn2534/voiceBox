@@ -513,7 +513,6 @@ def _synth_vowel_fixed(
         sr,
         f0_track=source.instantaneous_frequency,
         hnr_target_db=breathHnrDb,
-        harmonic=src,
     )
     return _normalize_peak(y, PEAK_DEFAULT)
 
@@ -696,7 +695,6 @@ def synth_vowel(
         sampleRate,
         f0_track=source.instantaneous_frequency,
         hnr_target_db=breathHnrDb,
-        harmonic=src,
     )
     if nasal_leak_depth > EPS and nasal_zeros[0].size > 0:
         y = _apply_nasal_antiresonances(
