@@ -36,6 +36,9 @@ _BREATH_NOISE_BPF_Q = 1.4
 _BREATH_NOISE_LPF_CUTOFF_HZ = 8000.0
 _BREATH_NOISE_LPF_Q = 1.0 / sqrt(2.0)
 _NYQUIST_SAFETY = 0.48
+_FORMANT_MIN_FREQ_HZ = 40.0
+_FORMANT_MIN_BW_HZ = 15.0
+_FORMANT_MAX_BW_RATIO = 0.45
 
 
 def _bandpass_biquad_coeff(f0: float, Q: float, sr: int) -> Tuple[float, float, float, float, float]:
@@ -127,6 +130,103 @@ def _biquad_process(x: np.ndarray, b0: float, b1: float, b2: float, a1: float, a
     return y
 
 
+def _bandpass_biquad_coeff_track(freq: np.ndarray, Q: np.ndarray, sr: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorised RBJ band-pass coefficients for time-varying parameters."""
+
+    freq = np.asarray(freq, dtype=np.float64)
+    Q = np.asarray(Q, dtype=np.float64)
+    if sr <= 0:
+        zeros = np.zeros_like(freq)
+        return zeros, zeros, zeros, zeros, zeros
+
+    w0 = 2.0 * np.pi * freq / float(sr)
+    w0 = np.clip(w0, 1e-4, np.pi * 0.995)
+    alpha = np.sin(w0) / (2.0 * np.maximum(Q, _RBJ_MIN_Q))
+    b0 = alpha
+    b1 = np.zeros_like(alpha)
+    b2 = -alpha
+    a0 = 1.0 + alpha
+    a1 = -2.0 * np.cos(w0)
+    a2 = 1.0 - alpha
+    return b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0
+
+
+def _biquad_process_timevarying(
+    x: np.ndarray,
+    b0: np.ndarray,
+    b1: np.ndarray,
+    b2: np.ndarray,
+    a1: np.ndarray,
+    a2: np.ndarray,
+) -> np.ndarray:
+    """Process ``x`` with per-sample biquad coefficients."""
+
+    x = _ensure_array(x).astype(np.float64, copy=False)
+    length = len(x)
+    if not (len(b0) == len(b1) == len(b2) == len(a1) == len(a2) == length):
+        raise ValueError('Coefficient tracks must match the source length')
+
+    y = np.empty_like(x)
+    x1 = x2 = y1 = y2 = 0.0
+    for i in range(length):
+        xi = x[i]
+        yi = b0[i] * xi + b1[i] * x1 + b2[i] * x2 - a1[i] * y1 - a2[i] * y2
+        y[i] = yi
+        x2 = x1
+        x1 = xi
+        y2 = y1
+        y1 = yi
+    return y
+
+
+def _apply_time_varying_formant_filters(
+    src: np.ndarray,
+    formants: np.ndarray,
+    bws: np.ndarray,
+    sr: int,
+) -> np.ndarray:
+    """Apply band-pass filters whose centre and bandwidth vary per-sample."""
+
+    x = _ensure_array(src).astype(np.float64, copy=False)
+    if x.size == 0:
+        return x
+
+    if formants.shape != bws.shape:
+        raise ValueError('Formant and bandwidth trajectories must share a shape')
+
+    if formants.shape[0] != x.size:
+        raise ValueError('Formant trajectories must match the source length')
+
+    total = np.zeros_like(x)
+    max_freq = float(sr) * _NYQUIST_SAFETY
+    max_bw = float(sr) * _FORMANT_MAX_BW_RATIO
+
+    for idx in range(formants.shape[1]):
+        base_freq = float(formants[0, idx])
+        freq_track = np.nan_to_num(
+            formants[:, idx],
+            nan=base_freq,
+            posinf=max_freq,
+            neginf=_FORMANT_MIN_FREQ_HZ,
+        )
+        freq_track = np.clip(freq_track, _FORMANT_MIN_FREQ_HZ, max_freq)
+
+        base_bw = float(bws[0, idx])
+        bw_track = np.nan_to_num(
+            bws[:, idx],
+            nan=base_bw,
+            posinf=max_bw,
+            neginf=_FORMANT_MIN_BW_HZ,
+        )
+        bw_track = np.clip(bw_track, _FORMANT_MIN_BW_HZ, max_bw)
+
+        Q = np.maximum(freq_track / np.maximum(bw_track, _FORMANT_MIN_BW_HZ), _RBJ_MIN_Q)
+        b0, b1, b2, a1, a2 = _bandpass_biquad_coeff_track(freq_track, Q, sr)
+        total += _biquad_process_timevarying(x, b0, b1, b2, a1, a2)
+
+    return _lip_radiation(total.astype(DTYPE, copy=False))
+
+
 def _one_pole_lp(x: np.ndarray, cutoff: float, sr: int) -> np.ndarray:
     """Simple one-pole low-pass filter."""
     x = _ensure_array(x)
@@ -154,10 +254,30 @@ def _lip_radiation(x: np.ndarray) -> np.ndarray:
 
 
 def _apply_formant_filters(src: np.ndarray, formants: Sequence[float], bws: Sequence[float], sr: int) -> np.ndarray:
-    out = np.zeros_like(src, dtype=DTYPE)
-    for f, bw in zip(formants, bws):
-        Q = max(0.5, float(f) / float(bw))
-        b0, b1, b2, a1, a2 = _bandpass_biquad_coeff(float(f), Q, sr)
+    if sr <= 0:
+        raise ValueError('Sample rate must be positive')
+
+    formants_arr = np.asarray(formants)
+    bws_arr = np.asarray(bws)
+
+    if formants_arr.ndim == 2 or bws_arr.ndim == 2:
+        if formants_arr.ndim != 2 or bws_arr.ndim != 2:
+            raise ValueError('Formant and bandwidth data must have matching dimensions')
+        return _apply_time_varying_formant_filters(src, formants_arr, bws_arr, sr)
+
+    formants_arr = formants_arr.astype(np.float64, copy=False).ravel()
+    bws_arr = bws_arr.astype(np.float64, copy=False).ravel()
+    if formants_arr.size != bws_arr.size:
+        raise ValueError('Formant and bandwidth arrays must share length')
+
+    out = np.zeros_like(_ensure_array(src), dtype=DTYPE)
+    max_freq = sr * _NYQUIST_SAFETY
+    max_bw = sr * _FORMANT_MAX_BW_RATIO
+    for f, bw in zip(formants_arr, bws_arr):
+        freq = float(np.clip(f, _FORMANT_MIN_FREQ_HZ, max_freq))
+        bw_val = float(np.clip(bw, _FORMANT_MIN_BW_HZ, max_bw))
+        Q = max(_RBJ_MIN_Q, freq / max(bw_val, _FORMANT_MIN_BW_HZ))
+        b0, b1, b2, a1, a2 = _bandpass_biquad_coeff(freq, Q, sr)
         out += _biquad_process(src, b0, b1, b2, a1, a2)
     return _lip_radiation(out)
 

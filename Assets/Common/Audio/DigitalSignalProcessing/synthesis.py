@@ -28,6 +28,9 @@ from .constants import (
     _NEUTRAL_TRACT_AREA_CM2,
     DTYPE,
     EPS,
+    FormantOuPhaseParams,
+    FormantOuSettings,
+    FormantPerturbationParams,
     NasalCoupling,
     SpeakerProfile,
 )
@@ -119,6 +122,139 @@ __all__ = [
     "synth_token_sequence",
     "synth_tokens_to_wav",
 ]
+
+
+_FORMANT_MIN_FREQ_HZ = 40.0
+_FORMANT_MAX_FREQ_RATIO = 0.48
+_FORMANT_MIN_BW_HZ = 15.0
+_FORMANT_MAX_BW_RATIO = 0.45
+
+
+def _resolve_formant_ou_phase(
+    speaker_profile: Optional[SpeakerProfile],
+    vowel: Optional[str],
+    phase: str,
+) -> Optional[FormantOuPhaseParams]:
+    """Return the OU parameters for a given vowel phase if available."""
+
+    if speaker_profile is None:
+        return None
+
+    settings: FormantOuSettings = speaker_profile.formant_ou
+    if settings is None:
+        return None
+
+    lookup_key = (vowel or '').lower()
+    model = settings.perVowel.get(lookup_key)
+    if model is None:
+        model = settings.default
+
+    candidate = getattr(model, phase, None)
+    if candidate is None:
+        candidate = model.sustain
+    return candidate
+
+
+def _formant_ou_enabled(params: Optional[FormantOuPhaseParams]) -> bool:
+    """Return True when the OU configuration yields non-zero modulation."""
+
+    if params is None:
+        return False
+    freq = params.frequency
+    bw = params.bandwidth
+    return (freq.sigma > EPS and freq.tauMilliseconds > 0.0) or (bw.sigma > EPS and bw.tauMilliseconds > 0.0)
+
+
+def _smooth_tracks(tracks: np.ndarray, sr: int, smoothing_ms: float) -> np.ndarray:
+    """Apply first-order low-pass smoothing to each column of ``tracks``."""
+
+    if tracks.size == 0 or smoothing_ms <= 0.0 or sr <= 0:
+        return tracks
+
+    tau_s = max(float(smoothing_ms), 0.0) / 1000.0
+    if tau_s <= 0.0:
+        return tracks
+
+    alpha = float(np.exp(-1.0 / (tau_s * sr)))
+    alpha = np.clip(alpha, 0.0, 0.999999)
+    smoothed = np.empty_like(tracks, dtype=np.float64)
+    state = tracks[0].astype(np.float64, copy=False)
+    smoothed[0] = state
+    for idx in range(1, tracks.shape[0]):
+        state = (1.0 - alpha) * tracks[idx] + alpha * state
+        smoothed[idx] = state
+    return smoothed
+
+
+def _generate_ou_offsets(
+    num_samples: int,
+    series_count: int,
+    sr: int,
+    params: FormantPerturbationParams,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Generate OU noise offsets for ``series_count`` parallel trajectories."""
+
+    sigma = max(float(params.sigma), 0.0)
+    if sigma <= EPS or num_samples <= 0 or sr <= 0:
+        return np.zeros((max(num_samples, 0), series_count), dtype=np.float64)
+
+    tau_s = max(float(params.tauMilliseconds), 1e-3) / 1000.0
+    dt = 1.0 / float(sr)
+    alpha = float(np.exp(-dt / tau_s))
+    alpha = np.clip(alpha, 0.0, 0.999999)
+    noise_std = sigma * float(np.sqrt(max(0.0, 1.0 - alpha * alpha)))
+    clip_limit = sigma * max(float(params.clipMultiple), 0.0)
+
+    offsets = np.zeros((num_samples, series_count), dtype=np.float64)
+    state = np.zeros(series_count, dtype=np.float64)
+    for idx in range(num_samples):
+        noise = rng.normal(0.0, noise_std, size=series_count)
+        state = alpha * state + noise
+        if clip_limit > 0.0:
+            state = np.clip(state, -clip_limit, clip_limit)
+        offsets[idx] = state
+
+    if params.smoothingMilliseconds > 0.0:
+        offsets = _smooth_tracks(offsets, sr, params.smoothingMilliseconds)
+        if clip_limit > 0.0:
+            offsets = np.clip(offsets, -clip_limit, clip_limit)
+    return offsets
+
+
+def _make_formant_tracks(
+    base_formants: Sequence[float],
+    base_bws: Sequence[float],
+    sample_count: int,
+    sr: int,
+    params: Optional[FormantOuPhaseParams],
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Create formant and bandwidth trajectories with optional OU modulation."""
+
+    formants = np.asarray(base_formants, dtype=np.float64).ravel()
+    bws = np.asarray(base_bws, dtype=np.float64).ravel()
+    if formants.size != bws.size:
+        raise ValueError('Formant and bandwidth arrays must share length')
+
+    if not _formant_ou_enabled(params):
+        return formants, bws
+
+    total_samples = max(int(sample_count), 0)
+    if total_samples <= 0 or sr <= 0:
+        return formants, bws
+
+    generator = rng if rng is not None else np.random.default_rng()
+    freq_offsets = _generate_ou_offsets(total_samples, formants.size, sr, params.frequency, generator)
+    bw_offsets = _generate_ou_offsets(total_samples, bws.size, sr, params.bandwidth, generator)
+
+    freq_tracks = formants[None, :] + freq_offsets
+    bw_tracks = bws[None, :] + bw_offsets
+    max_freq = sr * _FORMANT_MAX_FREQ_RATIO
+    max_bw = sr * _FORMANT_MAX_BW_RATIO
+    freq_tracks = np.clip(freq_tracks, _FORMANT_MIN_FREQ_HZ, max_freq)
+    bw_tracks = np.clip(bw_tracks, _FORMANT_MIN_BW_HZ, max_bw)
+    return freq_tracks, bw_tracks
 
 
 def _crossfade(a: np.ndarray, b: np.ndarray, sr: int, *, overlap_ms: float = 30.0) -> np.ndarray:
@@ -277,6 +413,7 @@ def _synth_vowel_fixed(
     useLegacyFormantFilter: bool = True,
     waveguideLipReflection: float = -0.85,
     waveguideWallLoss: float = 0.996,
+    formantOuPhase: Optional[FormantOuPhaseParams] = None,
 ) -> np.ndarray:
     """Synthesize a steady-state vowel for the provided tract configuration.
 
@@ -302,6 +439,7 @@ def _synth_vowel_fixed(
         useLegacyFormantFilter: Toggle between formant and waveguide model.
         waveguideLipReflection: Lip reflection coefficient for waveguide.
         waveguideWallLoss: Wall loss factor for waveguide.
+        formantOuPhase: OU modulation parameters for legacy formant filters.
     """
 
     src = _glottal_source(
@@ -320,7 +458,8 @@ def _synth_vowel_fixed(
     formants = np.asarray(formants, dtype=np.float64)
     bws = np.asarray(bws, dtype=np.float64)
     if useLegacyFormantFilter:
-        y = _apply_formant_filters(src, formants, bws, sr)
+        freq_targets, bw_targets = _make_formant_tracks(formants, bws, len(src), sr, formantOuPhase)
+        y = _apply_formant_filters(src, freq_targets, bw_targets, sr)
     else:
         sections = int(kellySections) if kellySections else len(_NEUTRAL_TRACT_AREA_CM2)
         profile: Optional[np.ndarray]
@@ -426,6 +565,7 @@ def synth_vowel(
     blend = _clamp(blend, 0.0, 1.0)
     formants = np.array(spec['F'], dtype=np.float64)
     bws = np.array(spec['BW'], dtype=np.float64)
+    sustain_phase = _resolve_formant_ou_phase(speakerProfile, vowel, 'sustain')
 
     nasal_zeros: Tuple[np.ndarray, np.ndarray] = (np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64))
     nasal_leak_depth = 0.0
@@ -476,7 +616,8 @@ def synth_vowel(
         bws = (1.0 - blend) * bws + blend * new_bw
 
     if useLegacyFormantFilter:
-        y = _apply_formant_filters(src, formants, bws, sampleRate)
+        freq_targets, bw_targets = _make_formant_tracks(formants, bws, len(src), sampleRate, sustain_phase)
+        y = _apply_formant_filters(src, freq_targets, bw_targets, sampleRate)
     else:
         neutral_profile: Optional[np.ndarray] = None
 
@@ -670,6 +811,7 @@ def synth_nasal(
 
     formants, bws = _estimate_nasal_formants(c, coupling)
     zeros, zero_bw = _nasal_branch_zeros(coupling, sampleRate)
+    ou_phase = _resolve_formant_ou_phase(speakerProfile, None, 'sustain')
 
     breath_level = float(breathLevelDb)
     breath_level += (1.0 - coupling.port_open) * 6.0
@@ -682,6 +824,7 @@ def synth_nasal(
         jitterCents=4.0,
         shimmerDb=0.4,
         breathLevelDb=breath_level,
+        formantOuPhase=ou_phase,
     )
     depth = _clamp(0.75 + 0.2 * coupling.port_open, 0.0, 1.0)
     if zeros.size > 0:
@@ -722,6 +865,10 @@ def synth_vowel_with_onset(
     vowel_kwargs.setdefault('vibratoFrequencyHz', DEFAULT_VIBRATO_FREQUENCY_HZ)
     vowel_kwargs.setdefault('tremorDepthCents', DEFAULT_TREMOR_DEPTH_CENTS)
     vowel_kwargs.setdefault('tremorFrequencyHz', DEFAULT_TREMOR_FREQUENCY_HZ)
+    speaker_profile: Optional[SpeakerProfile] = vowel_kwargs.get('speakerProfile')
+    onset_phase = _resolve_formant_ou_phase(speaker_profile, vowel, 'onset')
+    sustain_phase = _resolve_formant_ou_phase(speaker_profile, vowel, 'sustain')
+
     waveguide_opts = {
         'areaProfile': vowel_kwargs.get('areaProfile'),
         'articulation': vowel_kwargs.get('articulation'),
@@ -762,6 +909,7 @@ def synth_vowel_with_onset(
         onset_ms / 1000.0,
         sampleRate,
         **waveguide_opts,
+        formantOuPhase=onset_phase,
     )
     onset = _apply_fade(onset, sampleRate, attack_ms=6.0, release_ms=min(12.0, onset_ms * 0.5))
 
@@ -787,6 +935,7 @@ def synth_vowel_with_onset(
             rest_len_ms / 1000.0,
             sampleRate,
             **waveguide_opts,
+            formantOuPhase=sustain_phase,
         )
     sustain = _apply_fade(sustain, sampleRate, attack_ms=4.0, release_ms=12.0)
 

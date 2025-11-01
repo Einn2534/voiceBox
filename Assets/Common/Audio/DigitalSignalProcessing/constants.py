@@ -1,8 +1,10 @@
+# Created on 2024-07-09
+# Author: ChatGPT
+# Description: Shared data structures and lookup tables for the DSP helpers.
 """Shared data structures and lookup tables for the DSP helpers."""
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -15,6 +17,10 @@ __all__ = [
     "SPEED_OF_SOUND_CM_S",
     "_NEUTRAL_TRACT_AREA_CM2",
     "NasalCoupling",
+    "FormantPerturbationParams",
+    "FormantOuPhaseParams",
+    "FormantOuModel",
+    "FormantOuSettings",
     "SpeakerProfile",
     "VOWEL_TABLE",
     "CV_TOKEN_MAP",
@@ -64,10 +70,68 @@ class NasalCoupling:
 
 
 @dataclass(frozen=True)
+class FormantPerturbationParams:
+    """OU noise parameters for modulating a scalar trajectory."""
+
+    sigma: float = 0.0
+    tauMilliseconds: float = 120.0
+    clipMultiple: float = 2.5
+    smoothingMilliseconds: float = 12.0
+
+
+def _default_frequency_ou_params() -> FormantPerturbationParams:
+    """Return the default OU settings for formant center modulation."""
+
+    return FormantPerturbationParams(
+        sigma=18.0,
+        tauMilliseconds=95.0,
+        clipMultiple=2.0,
+        smoothingMilliseconds=8.0,
+    )
+
+
+def _default_bandwidth_ou_params() -> FormantPerturbationParams:
+    """Return the default OU settings for bandwidth modulation."""
+
+    return FormantPerturbationParams(
+        sigma=12.0,
+        tauMilliseconds=130.0,
+        clipMultiple=2.4,
+        smoothingMilliseconds=14.0,
+    )
+
+
+@dataclass(frozen=True)
+class FormantOuPhaseParams:
+    """Frequency and bandwidth OU parameters for one synthesis phase."""
+
+    frequency: FormantPerturbationParams = field(default_factory=_default_frequency_ou_params)
+    bandwidth: FormantPerturbationParams = field(default_factory=_default_bandwidth_ou_params)
+
+
+@dataclass(frozen=True)
+class FormantOuModel:
+    """Phase-dependent OU profiles for a vowel."""
+
+    sustain: FormantOuPhaseParams = field(default_factory=FormantOuPhaseParams)
+    onset: Optional[FormantOuPhaseParams] = None
+    release: Optional[FormantOuPhaseParams] = None
+
+
+@dataclass(frozen=True)
+class FormantOuSettings:
+    """Collection of OU profiles addressable by vowel and phase."""
+
+    default: FormantOuModel = field(default_factory=FormantOuModel)
+    perVowel: Dict[str, FormantOuModel] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class SpeakerProfile:
     """Minimal speaker description used by the procedural voice model."""
 
     nasal_coupling: NasalCoupling = field(default_factory=NasalCoupling)
+    formant_ou: FormantOuSettings = field(default_factory=FormantOuSettings)
 
 
 # ---- 母音プリセット（成人中性声の目安） ----
