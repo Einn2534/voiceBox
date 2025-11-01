@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from math import pi, sin, cos, exp
+from math import pi, sin, cos, exp, sqrt
 
 # =======================
 # Constants / Globals
@@ -27,6 +27,12 @@ LIP_END_CORRECTION_FACTOR = 0.6
 DEFAULT_FORMANT_COUNT = 3
 FORMANT_KEY = 'F'
 BANDWIDTH_KEY = 'BW'
+DEFAULT_DRIFT_CENTS = 12.0
+DEFAULT_DRIFT_RETURN_RATE = 0.35
+DEFAULT_VIBRATO_DEPTH_CENTS = 0.0
+DEFAULT_VIBRATO_FREQUENCY_HZ = 5.5
+DEFAULT_TREMOR_DEPTH_CENTS = 0.0
+DEFAULT_TREMOR_FREQUENCY_HZ = 8.5
 
 
 # =======================
@@ -650,8 +656,15 @@ def _glottal_source(
     sr: int,
     jitter_cents: float = 10.0,
     shimmer_db: float = 0.8,
+    *,
+    drift_cents: float = DEFAULT_DRIFT_CENTS,
+    drift_return_rate: float = DEFAULT_DRIFT_RETURN_RATE,
+    vibrato_depth_cents: float = DEFAULT_VIBRATO_DEPTH_CENTS,
+    vibrato_frequency_hz: float = DEFAULT_VIBRATO_FREQUENCY_HZ,
+    tremor_depth_cents: float = DEFAULT_TREMOR_DEPTH_CENTS,
+    tremor_frequency_hz: float = DEFAULT_TREMOR_FREQUENCY_HZ,
 ) -> np.ndarray:
-    """鋸波＋jitter/shimmer。位相加算で生成"""
+    """鋸波＋jitter/shimmer+OUドリフト+ビブラート合成。"""
     rng = np.random.default_rng()
     n = max(0, int(dur_s * sr))
     if n == 0:
@@ -665,8 +678,44 @@ def _glottal_source(
     for i in range(n):
         acc = pole * acc + (1.0 - pole) * jn[i]
         js[i] = acc
-    cents = (jitter_cents / 100.0) * js
-    inst_f = f0 * (2.0 ** (cents / 12.0))
+    jitter_semitones = (jitter_cents / 100.0) * js
+
+    drift = np.zeros(n, dtype=DTYPE)
+    if drift_cents > 0.0 and drift_return_rate > 0.0:
+        theta = float(drift_return_rate)
+        dt = 1.0 / float(sr)
+        sigma = float(drift_cents) * sqrt(2.0 * theta)
+        sqrt_dt = sqrt(dt)
+        state = 0.0
+        for i in range(n):
+            state += theta * (-state) * dt + sigma * sqrt_dt * rng.standard_normal()
+            drift[i] = state
+    drift_semitones = drift / 100.0
+
+    t = np.arange(n, dtype=np.float64) / float(sr)
+    vibrato_semitones = np.zeros(n, dtype=np.float64)
+    if vibrato_depth_cents != 0.0 and vibrato_frequency_hz > 0.0:
+        vib_phase = rng.uniform(0.0, 2.0 * pi)
+        vibrato_semitones = (
+            (vibrato_depth_cents / 100.0)
+            * np.sin(2.0 * pi * vibrato_frequency_hz * t + vib_phase)
+        )
+
+    tremor_semitones = np.zeros(n, dtype=np.float64)
+    if tremor_depth_cents != 0.0 and tremor_frequency_hz > 0.0:
+        tremor_phase = rng.uniform(0.0, 2.0 * pi)
+        tremor_semitones = (
+            (tremor_depth_cents / 100.0)
+            * np.sin(2.0 * pi * tremor_frequency_hz * t + tremor_phase)
+        )
+
+    composite_semitones = (
+        jitter_semitones.astype(np.float64)
+        + drift_semitones.astype(np.float64)
+        + vibrato_semitones
+        + tremor_semitones
+    )
+    inst_f = f0 * (2.0 ** (composite_semitones / 12.0))
 
     # 位相加算で鋸波
     phase = np.cumsum(2.0 * pi * inst_f / sr, dtype=np.float64)
@@ -733,10 +782,29 @@ def synth_vowel(
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
+    *,
+    driftCents: float = DEFAULT_DRIFT_CENTS,
+    driftReturnRate: float = DEFAULT_DRIFT_RETURN_RATE,
+    vibratoDepthCents: float = DEFAULT_VIBRATO_DEPTH_CENTS,
+    vibratoFrequencyHz: float = DEFAULT_VIBRATO_FREQUENCY_HZ,
+    tremorDepthCents: float = DEFAULT_TREMOR_DEPTH_CENTS,
+    tremorFrequencyHz: float = DEFAULT_TREMOR_FREQUENCY_HZ,
 ) -> np.ndarray:
     """母音合成"""
     assert vowel in VOWEL_TABLE, f"unsupported vowel: {vowel}"
-    src = _glottal_source(f0, durationSeconds, sampleRate, jitterCents, shimmerDb)
+    src = _glottal_source(
+        f0,
+        durationSeconds,
+        sampleRate,
+        jitterCents,
+        shimmerDb,
+        drift_cents=driftCents,
+        drift_return_rate=driftReturnRate,
+        vibrato_depth_cents=vibratoDepthCents,
+        vibrato_frequency_hz=vibratoFrequencyHz,
+        tremor_depth_cents=tremorDepthCents,
+        tremor_frequency_hz=tremorFrequencyHz,
+    )
     spec = VOWEL_TABLE[vowel]
     y = _apply_formant_filters(src, spec[FORMANT_KEY], spec[BANDWIDTH_KEY], sampleRate)
     y = _add_breath_noise(y, breathLevelDb)
@@ -852,9 +920,27 @@ def _synth_vowel_fixed(
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
+    driftCents: float = DEFAULT_DRIFT_CENTS,
+    driftReturnRate: float = DEFAULT_DRIFT_RETURN_RATE,
+    vibratoDepthCents: float = DEFAULT_VIBRATO_DEPTH_CENTS,
+    vibratoFrequencyHz: float = DEFAULT_VIBRATO_FREQUENCY_HZ,
+    tremorDepthCents: float = DEFAULT_TREMOR_DEPTH_CENTS,
+    tremorFrequencyHz: float = DEFAULT_TREMOR_FREQUENCY_HZ,
 ) -> np.ndarray:
     """与えたフォルマントで固定合成（短区間）"""
-    src = _glottal_source(f0, dur_s, sr, jitterCents, shimmerDb)
+    src = _glottal_source(
+        f0,
+        dur_s,
+        sr,
+        jitterCents,
+        shimmerDb,
+        drift_cents=driftCents,
+        drift_return_rate=driftReturnRate,
+        vibrato_depth_cents=vibratoDepthCents,
+        vibrato_frequency_hz=vibratoFrequencyHz,
+        tremor_depth_cents=tremorDepthCents,
+        tremor_frequency_hz=tremorFrequencyHz,
+    )
     y = _apply_formant_filters(src, formants, bws, sr)
     y = _add_breath_noise(y, breathLevelDb)
     return _normalize_peak(y, PEAK_DEFAULT)
@@ -880,19 +966,58 @@ def synth_vowel_with_onset(
     onsetMilliseconds: int = 45,
     onsetFormants: Optional[Sequence[float]] = None,
     onsetBandwidthScale: float = 0.85,
+    *,
+    jitterCents: float = 6.0,
+    shimmerDb: float = 0.6,
+    breathLevelDb: float = -40.0,
+    driftCents: float = DEFAULT_DRIFT_CENTS,
+    driftReturnRate: float = DEFAULT_DRIFT_RETURN_RATE,
+    vibratoDepthCents: float = DEFAULT_VIBRATO_DEPTH_CENTS,
+    vibratoFrequencyHz: float = DEFAULT_VIBRATO_FREQUENCY_HZ,
+    tremorDepthCents: float = DEFAULT_TREMOR_DEPTH_CENTS,
+    tremorFrequencyHz: float = DEFAULT_TREMOR_FREQUENCY_HZ,
 ) -> np.ndarray:
     """母音先頭だけフォルマント遷移を与える簡易版"""
     spec = VOWEL_TABLE[vowel]
     targetF, targetBW = spec[FORMANT_KEY], spec[BANDWIDTH_KEY]
     if not onsetFormants:
-        return synth_vowel(vowel=vowel, f0=f0, durationSeconds=totalMilliseconds / 1000.0, sampleRate=sampleRate)
+        return synth_vowel(
+            vowel=vowel,
+            f0=f0,
+            durationSeconds=totalMilliseconds / 1000.0,
+            sampleRate=sampleRate,
+            jitterCents=jitterCents,
+            shimmerDb=shimmerDb,
+            breathLevelDb=breathLevelDb,
+            driftCents=driftCents,
+            driftReturnRate=driftReturnRate,
+            vibratoDepthCents=vibratoDepthCents,
+            vibratoFrequencyHz=vibratoFrequencyHz,
+            tremorDepthCents=tremorDepthCents,
+            tremorFrequencyHz=tremorFrequencyHz,
+        )
 
     total_ms = int(max(10, totalMilliseconds))
     onset_ms = int(max(1, min(onsetMilliseconds, total_ms - 1)))
     sustain_ms = max(0, total_ms - onset_ms)
 
     onsetBW = [bw * float(onsetBandwidthScale) for bw in targetBW]
-    onset = _synth_vowel_fixed(onsetFormants, onsetBW, f0, onset_ms / 1000.0, sampleRate)
+    onset = _synth_vowel_fixed(
+        onsetFormants,
+        onsetBW,
+        f0,
+        onset_ms / 1000.0,
+        sampleRate,
+        jitterCents,
+        shimmerDb,
+        breathLevelDb,
+        driftCents,
+        driftReturnRate,
+        vibratoDepthCents,
+        vibratoFrequencyHz,
+        tremorDepthCents,
+        tremorFrequencyHz,
+    )
     onset = _apply_fade(onset, sampleRate, attack_ms=6.0, release_ms=min(12.0, onset_ms * 0.5))
 
     if sustain_ms <= 0:
@@ -901,7 +1026,22 @@ def synth_vowel_with_onset(
     ov_ms = min(max(6.0, onset_ms * 0.45), 14.0, float(sustain_ms))
     rest_len_ms = sustain_ms + max(0.0, ov_ms)
 
-    sustain = _synth_vowel_fixed(targetF, targetBW, f0, rest_len_ms / 1000.0, sampleRate)
+    sustain = _synth_vowel_fixed(
+        targetF,
+        targetBW,
+        f0,
+        rest_len_ms / 1000.0,
+        sampleRate,
+        jitterCents,
+        shimmerDb,
+        breathLevelDb,
+        driftCents,
+        driftReturnRate,
+        vibratoDepthCents,
+        vibratoFrequencyHz,
+        tremorDepthCents,
+        tremorFrequencyHz,
+    )
     sustain = _apply_fade(sustain, sampleRate, attack_ms=4.0, release_ms=12.0)
 
     return _crossfade(onset, sustain, sampleRate, overlap_ms=ov_ms)

@@ -47,7 +47,16 @@ from .filters import (
     _pre_emphasis,
 )
 from .io import write_wav
-from .sources import _gen_band_noise, _glottal_source
+from .sources import (
+    DEFAULT_DRIFT_CENTS,
+    DEFAULT_DRIFT_RETURN_RATE,
+    DEFAULT_TREMOR_DEPTH_CENTS,
+    DEFAULT_TREMOR_FREQUENCY_HZ,
+    DEFAULT_VIBRATO_DEPTH_CENTS,
+    DEFAULT_VIBRATO_FREQUENCY_HZ,
+    _gen_band_noise,
+    _glottal_source,
+)
 
 @dataclass(frozen=True)
 class TokenProsody:
@@ -112,6 +121,12 @@ def _synth_vowel_fixed(
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
+    driftCents: float = DEFAULT_DRIFT_CENTS,
+    driftReturnRate: float = DEFAULT_DRIFT_RETURN_RATE,
+    vibratoDepthCents: float = DEFAULT_VIBRATO_DEPTH_CENTS,
+    vibratoFrequencyHz: float = DEFAULT_VIBRATO_FREQUENCY_HZ,
+    tremorDepthCents: float = DEFAULT_TREMOR_DEPTH_CENTS,
+    tremorFrequencyHz: float = DEFAULT_TREMOR_FREQUENCY_HZ,
     areaProfile: Optional[Sequence[float]] = None,
     articulation: Optional[Dict[str, float]] = None,
     kellySections: Optional[int] = None,
@@ -119,7 +134,19 @@ def _synth_vowel_fixed(
     waveguideLipReflection: float = -0.85,
     waveguideWallLoss: float = 0.996,
 ) -> np.ndarray:
-    src = _glottal_source(f0, dur_s, sr, jitterCents, shimmerDb)
+    src = _glottal_source(
+        f0,
+        dur_s,
+        sr,
+        jitterCents,
+        shimmerDb,
+        drift_cents=driftCents,
+        drift_return_rate=driftReturnRate,
+        vibrato_depth_cents=vibratoDepthCents,
+        vibrato_frequency_hz=vibratoFrequencyHz,
+        tremor_depth_cents=tremorDepthCents,
+        tremor_frequency_hz=tremorFrequencyHz,
+    )
     formants = np.asarray(formants, dtype=np.float64)
     bws = np.asarray(bws, dtype=np.float64)
     if useLegacyFormantFilter:
@@ -158,6 +185,12 @@ def synth_vowel(
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
     *,
+    driftCents: float = DEFAULT_DRIFT_CENTS,
+    driftReturnRate: float = DEFAULT_DRIFT_RETURN_RATE,
+    vibratoDepthCents: float = DEFAULT_VIBRATO_DEPTH_CENTS,
+    vibratoFrequencyHz: float = DEFAULT_VIBRATO_FREQUENCY_HZ,
+    tremorDepthCents: float = DEFAULT_TREMOR_DEPTH_CENTS,
+    tremorFrequencyHz: float = DEFAULT_TREMOR_FREQUENCY_HZ,
     kellyBlend: Optional[float] = None,
     articulation: Optional[Dict[str, float]] = None,
     areaProfile: Optional[Sequence[float]] = None,
@@ -168,7 +201,19 @@ def synth_vowel(
     speakerProfile: Optional[SpeakerProfile] = None,
 ) -> np.ndarray:
     assert vowel in VOWEL_TABLE, f"unsupported vowel: {vowel}"
-    src = _glottal_source(f0, durationSeconds, sampleRate, jitterCents, shimmerDb)
+    src = _glottal_source(
+        f0,
+        durationSeconds,
+        sampleRate,
+        jitterCents,
+        shimmerDb,
+        drift_cents=driftCents,
+        drift_return_rate=driftReturnRate,
+        vibrato_depth_cents=vibratoDepthCents,
+        vibrato_frequency_hz=vibratoFrequencyHz,
+        tremor_depth_cents=tremorDepthCents,
+        tremor_frequency_hz=tremorFrequencyHz,
+    )
     spec = VOWEL_TABLE[vowel]
 
     if kellyBlend is None:
@@ -458,6 +503,15 @@ def synth_vowel_with_onset(
     spec = VOWEL_TABLE[vowel]
     targetF, targetBW = spec['F'], spec['BW']
     vowel_kwargs = dict(vowelModel or {})
+    vowel_kwargs.setdefault('jitterCents', 6.0)
+    vowel_kwargs.setdefault('shimmerDb', 0.6)
+    vowel_kwargs.setdefault('breathLevelDb', -40.0)
+    vowel_kwargs.setdefault('driftCents', DEFAULT_DRIFT_CENTS)
+    vowel_kwargs.setdefault('driftReturnRate', DEFAULT_DRIFT_RETURN_RATE)
+    vowel_kwargs.setdefault('vibratoDepthCents', DEFAULT_VIBRATO_DEPTH_CENTS)
+    vowel_kwargs.setdefault('vibratoFrequencyHz', DEFAULT_VIBRATO_FREQUENCY_HZ)
+    vowel_kwargs.setdefault('tremorDepthCents', DEFAULT_TREMOR_DEPTH_CENTS)
+    vowel_kwargs.setdefault('tremorFrequencyHz', DEFAULT_TREMOR_FREQUENCY_HZ)
     waveguide_opts = {
         'areaProfile': vowel_kwargs.get('areaProfile'),
         'articulation': vowel_kwargs.get('articulation'),
@@ -465,6 +519,15 @@ def synth_vowel_with_onset(
         'useLegacyFormantFilter': vowel_kwargs.get('useLegacyFormantFilter', True),
         'waveguideLipReflection': vowel_kwargs.get('waveguideLipReflection', -0.85),
         'waveguideWallLoss': vowel_kwargs.get('waveguideWallLoss', 0.996),
+        'jitterCents': vowel_kwargs['jitterCents'],
+        'shimmerDb': vowel_kwargs['shimmerDb'],
+        'breathLevelDb': vowel_kwargs['breathLevelDb'],
+        'driftCents': vowel_kwargs['driftCents'],
+        'driftReturnRate': vowel_kwargs['driftReturnRate'],
+        'vibratoDepthCents': vowel_kwargs['vibratoDepthCents'],
+        'vibratoFrequencyHz': vowel_kwargs['vibratoFrequencyHz'],
+        'tremorDepthCents': vowel_kwargs['tremorDepthCents'],
+        'tremorFrequencyHz': vowel_kwargs['tremorFrequencyHz'],
     }
 
     if not onsetFormants:
