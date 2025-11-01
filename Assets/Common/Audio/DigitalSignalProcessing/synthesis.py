@@ -51,12 +51,19 @@ from .filters import (
 )
 from .io import write_wav
 from .sources import (
+    DEFAULT_AM_OU_CLIP_MULTIPLE,
+    DEFAULT_AM_OU_SIGMA,
+    DEFAULT_AM_OU_TAU,
     DEFAULT_DRIFT_CENTS,
     DEFAULT_DRIFT_RETURN_RATE,
+    DEFAULT_SHIMMER_PERCENT,
+    DEFAULT_TREMOLO_DEPTH_DB,
+    DEFAULT_TREMOLO_FREQUENCY_HZ,
     DEFAULT_TREMOR_DEPTH_CENTS,
     DEFAULT_TREMOR_FREQUENCY_HZ,
     DEFAULT_VIBRATO_DEPTH_CENTS,
     DEFAULT_VIBRATO_FREQUENCY_HZ,
+    GlottalSourceResult,
     _gen_band_noise,
     _glottal_source,
 )
@@ -399,6 +406,12 @@ def _synth_vowel_fixed(
     *,
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
+    shimmerPercent: Optional[float] = None,
+    tremoloDepthDb: float = DEFAULT_TREMOLO_DEPTH_DB,
+    tremoloFrequencyHz: float = DEFAULT_TREMOLO_FREQUENCY_HZ,
+    amplitudeOuSigma: float = DEFAULT_AM_OU_SIGMA,
+    amplitudeOuTau: float = DEFAULT_AM_OU_TAU,
+    amplitudeOuClipMultiple: float = DEFAULT_AM_OU_CLIP_MULTIPLE,
     breathLevelDb: float = -40.0,
     breathHnrDb: Optional[float] = None,
     driftCents: float = DEFAULT_DRIFT_CENTS,
@@ -424,7 +437,13 @@ def _synth_vowel_fixed(
         dur_s: Duration in seconds.
         sr: Sample rate in Hz.
         jitterCents: Amount of fast pitch variation in cents.
-        shimmerDb: Amplitude modulation depth in dB.
+        shimmerDb: Legacy shimmer depth in dB.
+        shimmerPercent: Optional shimmer depth expressed as linear fraction.
+        tremoloDepthDb: Tremolo depth in dB.
+        tremoloFrequencyHz: Tremolo rate in Hz.
+        amplitudeOuSigma: OU sigma controlling slow amplitude wander.
+        amplitudeOuTau: OU time constant in seconds for amplitude wander.
+        amplitudeOuClipMultiple: Clip multiple used for amplitude OU limiting.
         breathLevelDb: Legacy breath level relative to harmonic RMS.
         breathHnrDb: Optional HNR target used to derive noise gain.
         driftCents: Slow pitch drift depth in cents.
@@ -442,7 +461,7 @@ def _synth_vowel_fixed(
         formantOuPhase: OU modulation parameters for legacy formant filters.
     """
 
-    src = _glottal_source(
+    source: GlottalSourceResult = _glottal_source(
         f0,
         dur_s,
         sr,
@@ -454,7 +473,14 @@ def _synth_vowel_fixed(
         vibrato_frequency_hz=vibratoFrequencyHz,
         tremor_depth_cents=tremorDepthCents,
         tremor_frequency_hz=tremorFrequencyHz,
+        tremolo_depth_db=tremoloDepthDb,
+        tremolo_frequency_hz=tremoloFrequencyHz,
+        shimmer_percent=shimmerPercent,
+        amplitude_ou_sigma=amplitudeOuSigma,
+        amplitude_ou_tau=amplitudeOuTau,
+        amplitude_ou_clip_multiple=amplitudeOuClipMultiple,
     )
+    src = source.signal
     formants = np.asarray(formants, dtype=np.float64)
     bws = np.asarray(bws, dtype=np.float64)
     if useLegacyFormantFilter:
@@ -485,8 +511,9 @@ def _synth_vowel_fixed(
         y,
         breathLevelDb,
         sr,
-        f0_track=f0,
+        f0_track=source.instantaneous_frequency,
         hnr_target_db=breathHnrDb,
+        harmonic=src,
     )
     return _normalize_peak(y, PEAK_DEFAULT)
 
@@ -498,8 +525,14 @@ def synth_vowel(
     sampleRate: int = 22050,
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
+    shimmerPercent: Optional[float] = DEFAULT_SHIMMER_PERCENT,
+    tremoloDepthDb: float = DEFAULT_TREMOLO_DEPTH_DB,
+    tremoloFrequencyHz: float = DEFAULT_TREMOLO_FREQUENCY_HZ,
+    amplitudeOuSigma: float = DEFAULT_AM_OU_SIGMA,
+    amplitudeOuTau: float = DEFAULT_AM_OU_TAU,
+    amplitudeOuClipMultiple: float = DEFAULT_AM_OU_CLIP_MULTIPLE,
     breathLevelDb: float = -40.0,
-    breathHnrDb: Optional[float] = None,
+    breathHnrDb: Optional[float] = 20.0,
     *,
     driftCents: float = DEFAULT_DRIFT_CENTS,
     driftReturnRate: float = DEFAULT_DRIFT_RETURN_RATE,
@@ -524,7 +557,13 @@ def synth_vowel(
         durationSeconds: Output duration in seconds.
         sampleRate: Rendering sample rate in Hz.
         jitterCents: Fast pitch jitter amount in cents.
-        shimmerDb: Amplitude jitter in dB.
+        shimmerDb: Legacy shimmer specification in dB.
+        shimmerPercent: Optional shimmer magnitude expressed as fraction.
+        tremoloDepthDb: Tremolo depth in dB.
+        tremoloFrequencyHz: Tremolo rate in Hz.
+        amplitudeOuSigma: OU sigma for slow amplitude wander.
+        amplitudeOuTau: OU time constant for amplitude wander in seconds.
+        amplitudeOuClipMultiple: Clip multiple used for amplitude OU limiting.
         breathLevelDb: Legacy breath gain relative to harmonics.
         breathHnrDb: Optional HNR target driving breath noise gain.
         driftCents: Slow pitch drift amount in cents.
@@ -543,7 +582,7 @@ def synth_vowel(
         speakerProfile: Optional speaker profile overrides.
     """
     assert vowel in VOWEL_TABLE, f"unsupported vowel: {vowel}"
-    src = _glottal_source(
+    source: GlottalSourceResult = _glottal_source(
         f0,
         durationSeconds,
         sampleRate,
@@ -555,7 +594,14 @@ def synth_vowel(
         vibrato_frequency_hz=vibratoFrequencyHz,
         tremor_depth_cents=tremorDepthCents,
         tremor_frequency_hz=tremorFrequencyHz,
+        tremolo_depth_db=tremoloDepthDb,
+        tremolo_frequency_hz=tremoloFrequencyHz,
+        shimmer_percent=shimmerPercent,
+        amplitude_ou_sigma=amplitudeOuSigma,
+        amplitude_ou_tau=amplitudeOuTau,
+        amplitude_ou_clip_multiple=amplitudeOuClipMultiple,
     )
+    src = source.signal
     spec = VOWEL_TABLE[vowel]
 
     if kellyBlend is None:
@@ -648,8 +694,9 @@ def synth_vowel(
         y,
         breathLevelDb,
         sampleRate,
-        f0_track=f0,
+        f0_track=source.instantaneous_frequency,
         hnr_target_db=breathHnrDb,
+        harmonic=src,
     )
     if nasal_leak_depth > EPS and nasal_zeros[0].size > 0:
         y = _apply_nasal_antiresonances(
@@ -857,8 +904,14 @@ def synth_vowel_with_onset(
     vowel_kwargs = dict(vowelModel or {})
     vowel_kwargs.setdefault('jitterCents', 6.0)
     vowel_kwargs.setdefault('shimmerDb', 0.6)
+    vowel_kwargs.setdefault('shimmerPercent', DEFAULT_SHIMMER_PERCENT)
+    vowel_kwargs.setdefault('tremoloDepthDb', DEFAULT_TREMOLO_DEPTH_DB)
+    vowel_kwargs.setdefault('tremoloFrequencyHz', DEFAULT_TREMOLO_FREQUENCY_HZ)
+    vowel_kwargs.setdefault('amplitudeOuSigma', DEFAULT_AM_OU_SIGMA)
+    vowel_kwargs.setdefault('amplitudeOuTau', DEFAULT_AM_OU_TAU)
+    vowel_kwargs.setdefault('amplitudeOuClipMultiple', DEFAULT_AM_OU_CLIP_MULTIPLE)
     vowel_kwargs.setdefault('breathLevelDb', -40.0)
-    vowel_kwargs.setdefault('breathHnrDb', None)
+    vowel_kwargs.setdefault('breathHnrDb', 20.0)
     vowel_kwargs.setdefault('driftCents', DEFAULT_DRIFT_CENTS)
     vowel_kwargs.setdefault('driftReturnRate', DEFAULT_DRIFT_RETURN_RATE)
     vowel_kwargs.setdefault('vibratoDepthCents', DEFAULT_VIBRATO_DEPTH_CENTS)
@@ -878,6 +931,12 @@ def synth_vowel_with_onset(
         'waveguideWallLoss': vowel_kwargs.get('waveguideWallLoss', 0.996),
         'jitterCents': vowel_kwargs['jitterCents'],
         'shimmerDb': vowel_kwargs['shimmerDb'],
+        'shimmerPercent': vowel_kwargs['shimmerPercent'],
+        'tremoloDepthDb': vowel_kwargs['tremoloDepthDb'],
+        'tremoloFrequencyHz': vowel_kwargs['tremoloFrequencyHz'],
+        'amplitudeOuSigma': vowel_kwargs['amplitudeOuSigma'],
+        'amplitudeOuTau': vowel_kwargs['amplitudeOuTau'],
+        'amplitudeOuClipMultiple': vowel_kwargs['amplitudeOuClipMultiple'],
         'breathLevelDb': vowel_kwargs['breathLevelDb'],
         'breathHnrDb': vowel_kwargs['breathHnrDb'],
         'driftCents': vowel_kwargs['driftCents'],
@@ -962,7 +1021,7 @@ def synth_cv(
 
     head = np.zeros(_ms_to_samples(preMilliseconds, sampleRate), dtype=DTYPE)
     vowel_kwargs = dict(vowelModel or {})
-    vowel_kwargs.setdefault('breathHnrDb', None)
+    vowel_kwargs.setdefault('breathHnrDb', 20.0)
     if speakerProfile is not None:
         vowel_kwargs.setdefault('speakerProfile', speakerProfile)
     speaker_profile: Optional[SpeakerProfile] = vowel_kwargs.get('speakerProfile')
