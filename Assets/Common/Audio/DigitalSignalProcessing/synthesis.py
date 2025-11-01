@@ -77,6 +77,32 @@ _MIN_NASAL_DURATION_MS = 80.0
 _NASAL_DURATION_RATIO = 0.6
 _PAUSE_MULTIPLIER = 3.0
 _MIN_PAUSE_DURATION_MS = 120.0
+_DURATION_OU_THETA = 0.45
+_DURATION_OU_SIGMA = 0.018
+_DURATION_JITTER_STD = 0.006
+_DURATION_SCALE_LIMIT = 0.08
+_PHRASE_SCALE_MIN = 0.6
+_PHRASE_SCALE_MAX = 1.4
+_INHALE_MIN_MS = 120.0
+_INHALE_ACTIVE_RATIO = 0.65
+_INHALE_ATTACK_RATIO = 0.3
+_INHALE_LEVEL_DB = -28.0
+_INHALE_SILENCE_RATIO = 0.2
+_INHALE_NOISE_CUTOFF_HZ = 2600.0
+_CONSONANT_BASE_DURATION_MS: Dict[str, float] = {
+    's': 90.0,
+    'sh': 110.0,
+    'h': 80.0,
+    'f': 90.0,
+    't': 60.0,
+    'k': 72.0,
+    'ch': 120.0,
+    'ts': 120.0,
+    'n': 90.0,
+    'm': 110.0,
+    'w': 44.0,
+    'y': 40.0,
+}
 
 
 __all__ = [
@@ -109,6 +135,123 @@ def _crossfade(a: np.ndarray, b: np.ndarray, sr: int, *, overlap_ms: float = 30.
     fade_in = np.linspace(0.0, 1.0, overlap, dtype=DTYPE)
     blended = a[-overlap:] * fade_out + b[:overlap] * fade_in
     return np.concatenate([left, blended, right]).astype(DTYPE, copy=False)
+
+
+def _sample_duration_scale(
+    previous_state: float,
+    rng: np.random.Generator,
+) -> Tuple[float, float]:
+    """Generate a smooth duration multiplier using an OU process with jitter."""
+
+    drift = -_DURATION_OU_THETA * previous_state
+    state = previous_state + drift + rng.normal(0.0, _DURATION_OU_SIGMA)
+    deviation = np.clip(
+        state + rng.normal(0.0, _DURATION_JITTER_STD),
+        -_DURATION_SCALE_LIMIT,
+        _DURATION_SCALE_LIMIT,
+    )
+    scale = 1.0 + float(deviation)
+    return scale, float(state)
+
+
+def _build_phrase_scale_lookup(
+    tokens: Sequence[str],
+    phrase_scale_bounds: Optional[Sequence[Tuple[float, float]]],
+) -> Dict[int, float]:
+    """Return per-token phrase scales interpolated between provided bounds."""
+
+    if not tokens:
+        return {}
+
+    normalized_tokens = [str(t).strip().lower() for t in tokens]
+    phrase_indices: List[List[int]] = []
+    current: List[int] = []
+    for idx, token in enumerate(normalized_tokens):
+        if token == PAUSE_TOKEN:
+            if current:
+                phrase_indices.append(current)
+                current = []
+            continue
+        current.append(idx)
+    if current:
+        phrase_indices.append(current)
+
+    if not phrase_indices:
+        return {}
+
+    bounds = list(phrase_scale_bounds or [])
+    if bounds:
+        bounds = [
+            (
+                float(np.clip(start, _PHRASE_SCALE_MIN, _PHRASE_SCALE_MAX)),
+                float(np.clip(end, _PHRASE_SCALE_MIN, _PHRASE_SCALE_MAX)),
+            )
+            for start, end in bounds
+        ]
+
+    lookup: Dict[int, float] = {}
+    for phrase_idx, token_indices in enumerate(phrase_indices):
+        if not token_indices:
+            continue
+        if bounds:
+            start_scale, end_scale = bounds[min(phrase_idx, len(bounds) - 1)]
+        else:
+            start_scale = end_scale = 1.0
+        denom = max(1, len(token_indices) - 1)
+        for local_pos, token_idx in enumerate(token_indices):
+            alpha = local_pos / denom
+            interp_scale = (1.0 - alpha) * start_scale + alpha * end_scale
+            lookup[token_idx] = float(np.clip(interp_scale, _PHRASE_SCALE_MIN, _PHRASE_SCALE_MAX))
+    return lookup
+
+
+def _synth_pause_with_inhale(
+    pause_ms: float,
+    sample_rate: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Create an inhalation-style pause with shaped noise and silence padding."""
+
+    total_samples = _ms_to_samples(int(pause_ms), sample_rate)
+    if total_samples == 0:
+        return np.zeros(0, dtype=DTYPE)
+
+    breath_ms = max(_INHALE_MIN_MS, pause_ms * _INHALE_ACTIVE_RATIO)
+    breath_samples = min(total_samples, _ms_to_samples(int(breath_ms), sample_rate))
+    if breath_samples <= 0:
+        return np.zeros(total_samples, dtype=DTYPE)
+
+    noise = rng.standard_normal(breath_samples).astype(DTYPE)
+    shaped = _one_pole_lp(noise, cutoff=_INHALE_NOISE_CUTOFF_HZ, sr=sample_rate)
+
+    attack_samples = max(1, int(breath_samples * _INHALE_ATTACK_RATIO))
+    release_samples = max(1, breath_samples - attack_samples)
+    attack_env = np.linspace(0.0, 1.0, attack_samples, dtype=DTYPE)
+    release_env = np.linspace(1.0, 0.0, release_samples, dtype=DTYPE)
+    envelope = np.concatenate([attack_env, release_env])
+    envelope = envelope[:breath_samples]
+    if envelope.size < breath_samples:
+        envelope = np.pad(envelope, (0, breath_samples - envelope.size), mode='edge')
+
+    amplitude = 10.0 ** (_INHALE_LEVEL_DB / 20.0)
+    breath = shaped * envelope * amplitude
+
+    remaining_samples = max(0, total_samples - breath_samples)
+    leading_silence = int(remaining_samples * (_INHALE_SILENCE_RATIO / 2.0))
+    trailing_silence = remaining_samples - leading_silence
+    if leading_silence < 0:
+        leading_silence = 0
+    if trailing_silence < 0:
+        trailing_silence = 0
+
+    head = np.zeros(leading_silence, dtype=DTYPE)
+    tail = np.zeros(trailing_silence, dtype=DTYPE)
+    pause = np.concatenate([head, breath, tail]).astype(DTYPE, copy=False)
+    if pause.size < total_samples:
+        pause = np.pad(pause, (0, total_samples - pause.size))
+    elif pause.size > total_samples:
+        pause = pause[:total_samples]
+    return pause
 
 
 def _synth_vowel_fixed(
@@ -957,6 +1100,7 @@ def synth_token_sequence(
     vowelModel: Optional[Dict[str, Any]] = None,
     speakerProfile: Optional[SpeakerProfile] = None,
     tokenProsody: Optional[Sequence[Optional[TokenProsody]]] = None,
+    phraseDurationScaleBounds: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> np.ndarray:
     """Synthesize a token sequence with optional per-token prosody overrides.
 
@@ -971,6 +1115,7 @@ def synth_token_sequence(
         vowelModel: Optional vowel synthesis overrides.
         speakerProfile: Speaker profile used for nasal coupling and timbre.
         tokenProsody: Optional overrides for pitch and timing per token index.
+        phraseDurationScaleBounds: Optional per-phrase (start, end) duration scales.
     """
 
     segs: List[np.ndarray] = []
@@ -982,6 +1127,9 @@ def synth_token_sequence(
         vowel_kwargs.setdefault('speakerProfile', speakerProfile)
     speaker_profile: Optional[SpeakerProfile] = vowel_kwargs.get('speakerProfile')
     nasal_coupling = speaker_profile.nasal_coupling if speaker_profile is not None else None
+    rng = np.random.default_rng()
+    phrase_scale_lookup = _build_phrase_scale_lookup(tokens, phraseDurationScaleBounds)
+    ou_state = 0.0
 
     for idx, tok in enumerate(tokens):
         t = tok.strip().lower()
@@ -994,26 +1142,7 @@ def synth_token_sequence(
 
         token_f0 = float(f0) if prosody is None or prosody.f0 is None else float(prosody.f0)
 
-        token_vowel_ms = default_vowel_ms
-        if prosody is not None and prosody.vowelMilliseconds is not None:
-            token_vowel_ms = max(_MIN_SCALED_VOWEL_MS, float(prosody.vowelMilliseconds))
-        elif prosody is not None and prosody.durationScale is not None:
-            token_vowel_ms = max(
-                _MIN_SCALED_VOWEL_MS,
-                default_vowel_ms * max(0.05, float(prosody.durationScale)),
-            )
-
-        token_overlap_ms = int(overlapMilliseconds)
-        if prosody is not None and prosody.overlapMilliseconds is not None:
-            token_overlap_ms = max(0, int(prosody.overlapMilliseconds))
-
-        token_gap_ms = default_gap_ms
-        if prosody is not None and prosody.gapMilliseconds is not None:
-            token_gap_ms = max(0.0, float(prosody.gapMilliseconds))
-        elif prosody is not None and prosody.durationScale is not None:
-            token_gap_ms = max(0.0, default_gap_ms * max(0.0, float(prosody.durationScale)))
-
-        token_gap_samples = _ms_to_samples(int(token_gap_ms), sampleRate)
+        phrase_scale = phrase_scale_lookup.get(idx, 1.0)
 
         if t == PAUSE_TOKEN:
             pause_ms = max(default_gap_ms * _PAUSE_MULTIPLIER, _MIN_PAUSE_DURATION_MS)
@@ -1027,24 +1156,64 @@ def synth_token_sequence(
                     )
                 elif prosody.gapMilliseconds is not None:
                     pause_ms = max(0.0, float(prosody.gapMilliseconds))
-            segs.append(np.zeros(_ms_to_samples(int(pause_ms), sampleRate), dtype=DTYPE))
+            pause_ms *= phrase_scale
+            segs.append(_synth_pause_with_inhale(pause_ms, sampleRate, rng))
+            ou_state = 0.0
             continue
+
+        duration_scale, ou_state = _sample_duration_scale(ou_state, rng)
+        composite_scale = phrase_scale * duration_scale
+
+        base_vowel_ms = default_vowel_ms
+        if prosody is not None and prosody.vowelMilliseconds is not None:
+            base_vowel_ms = max(_MIN_SCALED_VOWEL_MS, float(prosody.vowelMilliseconds))
+        elif prosody is not None and prosody.durationScale is not None:
+            base_vowel_ms = max(
+                _MIN_SCALED_VOWEL_MS,
+                default_vowel_ms * max(0.05, float(prosody.durationScale)),
+            )
+        token_vowel_ms = max(_MIN_SCALED_VOWEL_MS, base_vowel_ms * composite_scale)
+
+        base_overlap_ms = float(overlapMilliseconds)
+        if prosody is not None and prosody.overlapMilliseconds is not None:
+            base_overlap_ms = max(0.0, float(prosody.overlapMilliseconds))
+        token_overlap_ms = max(0, int(round(base_overlap_ms * composite_scale)))
+
+        base_gap_ms = default_gap_ms
+        if prosody is not None and prosody.gapMilliseconds is not None:
+            base_gap_ms = max(0.0, float(prosody.gapMilliseconds))
+        elif prosody is not None and prosody.durationScale is not None:
+            base_gap_ms = max(0.0, default_gap_ms * max(0.0, float(prosody.durationScale)))
+        gap_ms = max(0.0, base_gap_ms * composite_scale)
+        token_gap_samples = _ms_to_samples(int(round(gap_ms)), sampleRate)
+
+        pre_ms: Optional[float] = None
+        if prosody is not None and prosody.preMilliseconds is not None:
+            pre_ms = max(0.0, float(prosody.preMilliseconds) * composite_scale)
+
+        consonant_ms: Optional[float] = None
+        if prosody is not None and prosody.consonantMilliseconds is not None:
+            consonant_ms = max(0.0, float(prosody.consonantMilliseconds) * composite_scale)
 
         if t in CV_TOKEN_MAP:
             ck, vk = CV_TOKEN_MAP[t]
+            if consonant_ms is None:
+                base_cons = _CONSONANT_BASE_DURATION_MS.get(ck)
+                if base_cons is not None:
+                    consonant_ms = max(0.0, base_cons * composite_scale)
             cv_kwargs: Dict[str, Any] = {
                 'f0': token_f0,
                 'sampleRate': sampleRate,
-                'vowelMilliseconds': int(token_vowel_ms),
+                'vowelMilliseconds': int(round(token_vowel_ms)),
                 'overlapMilliseconds': token_overlap_ms,
                 'useOnsetTransition': useOnsetTransition,
                 'vowelModel': vowel_kwargs,
                 'speakerProfile': speaker_profile,
             }
-            if prosody is not None and prosody.preMilliseconds is not None:
-                cv_kwargs['preMilliseconds'] = max(0, int(prosody.preMilliseconds))
-            if prosody is not None and prosody.consonantMilliseconds is not None:
-                cv_kwargs['consonantMilliseconds'] = max(0, int(prosody.consonantMilliseconds))
+            if pre_ms is not None:
+                cv_kwargs['preMilliseconds'] = int(round(pre_ms))
+            if consonant_ms is not None:
+                cv_kwargs['consonantMilliseconds'] = int(round(consonant_ms))
             seg = synth_cv(ck, vk, **cv_kwargs)
 
         elif t in VOWEL_TABLE:
@@ -1059,10 +1228,10 @@ def synth_token_sequence(
         elif t in NASAL_TOKEN_MAP:
             nasal_ms = max(
                 _MIN_NASAL_DURATION_MS,
-                int(token_vowel_ms * _NASAL_DURATION_RATIO),
+                int(round(token_vowel_ms * _NASAL_DURATION_RATIO)),
             )
-            if prosody is not None and prosody.consonantMilliseconds is not None:
-                nasal_ms = max(_MIN_NASAL_DURATION_MS, int(prosody.consonantMilliseconds))
+            if consonant_ms is not None:
+                nasal_ms = max(_MIN_NASAL_DURATION_MS, int(round(consonant_ms)))
             seg = synth_nasal(
                 NASAL_TOKEN_MAP[t],
                 f0=token_f0,
@@ -1099,6 +1268,7 @@ def synth_tokens_to_wav(
     vowelModel: Optional[Dict[str, Any]] = None,
     speakerProfile: Optional[SpeakerProfile] = None,
     tokenProsody: Optional[Sequence[Optional[TokenProsody]]] = None,
+    phraseDurationScaleBounds: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> str:
     """Render a token sequence to disk while allowing per-token prosody overrides.
 
@@ -1114,6 +1284,7 @@ def synth_tokens_to_wav(
         vowelModel: Optional vowel synthesis overrides.
         speakerProfile: Speaker profile used for nasal coupling and timbre.
         tokenProsody: Optional overrides for pitch and timing per token index.
+        phraseDurationScaleBounds: Optional per-phrase (start, end) duration scales.
     """
 
     y = synth_token_sequence(
@@ -1127,5 +1298,6 @@ def synth_tokens_to_wav(
         vowelModel=vowelModel,
         speakerProfile=speakerProfile,
         tokenProsody=tokenProsody,
+        phraseDurationScaleBounds=phraseDurationScaleBounds,
     )
     return write_wav(outPath, y, sampleRate=sampleRate)
