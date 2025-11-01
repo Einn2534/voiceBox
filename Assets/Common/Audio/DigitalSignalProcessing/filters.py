@@ -1,7 +1,10 @@
+# Created on 2024-08-28
+# Created by ChatGPT
+# Description: Filter design and processing helpers.
 """Filter design and processing helpers."""
 from __future__ import annotations
 
-from math import cos, exp, pi, sin
+from math import cos, exp, pi, sin, sqrt
 from typing import Iterable, Sequence, Tuple
 
 import numpy as np
@@ -21,7 +24,18 @@ __all__ = [
     "_apply_all_pole_filter",
     "_apply_kelly_lochbaum_filter",
     "_pre_emphasis",
+    "_apply_breath_noise_coloration",
 ]
+
+
+_RBJ_MIN_Q = 0.5
+_BREATH_NOISE_HPF_CUTOFF_HZ = 2000.0
+_BREATH_NOISE_HPF_Q = 1.0 / sqrt(2.0)
+_BREATH_NOISE_BPF_CENTER_HZ = 5000.0
+_BREATH_NOISE_BPF_Q = 1.4
+_BREATH_NOISE_LPF_CUTOFF_HZ = 8000.0
+_BREATH_NOISE_LPF_Q = 1.0 / sqrt(2.0)
+_NYQUIST_SAFETY = 0.48
 
 
 def _bandpass_biquad_coeff(f0: float, Q: float, sr: int) -> Tuple[float, float, float, float, float]:
@@ -33,6 +47,42 @@ def _bandpass_biquad_coeff(f0: float, Q: float, sr: int) -> Tuple[float, float, 
     b2 = -alpha
     a0 = 1.0 + alpha
     a1 = -2.0 * cos(w0)
+    a2 = 1.0 - alpha
+    return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+
+
+def _lowpass_biquad_coeff(cutoff: float, Q: float, sr: int) -> Tuple[float, float, float, float, float]:
+    """RBJ low-pass filter coefficients."""
+
+    cutoff = float(max(cutoff, 0.0))
+    if sr <= 0 or cutoff <= 0.0:
+        return 1.0, 0.0, 0.0, 0.0, 0.0
+    w0 = 2.0 * pi * cutoff / sr
+    alpha = sin(w0) / (2.0 * max(Q, _RBJ_MIN_Q))
+    cos_w0 = cos(w0)
+    b0 = (1.0 - cos_w0) * 0.5
+    b1 = 1.0 - cos_w0
+    b2 = (1.0 - cos_w0) * 0.5
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cos_w0
+    a2 = 1.0 - alpha
+    return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+
+
+def _highpass_biquad_coeff(cutoff: float, Q: float, sr: int) -> Tuple[float, float, float, float, float]:
+    """RBJ high-pass filter coefficients."""
+
+    cutoff = float(max(cutoff, 0.0))
+    if sr <= 0 or cutoff <= 0.0:
+        return 1.0, 0.0, 0.0, 0.0, 0.0
+    w0 = 2.0 * pi * cutoff / sr
+    alpha = sin(w0) / (2.0 * max(Q, _RBJ_MIN_Q))
+    cos_w0 = cos(w0)
+    b0 = (1.0 + cos_w0) * 0.5
+    b1 = -(1.0 + cos_w0)
+    b2 = (1.0 + cos_w0) * 0.5
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cos_w0
     a2 = 1.0 - alpha
     return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
 
@@ -191,6 +241,38 @@ def _apply_kelly_lochbaum_filter(
     if applyRadiation:
         y = _lip_radiation(y)
     return y
+
+
+def _apply_breath_noise_coloration(x: np.ndarray, sr: int) -> np.ndarray:
+    """Emphasise 2–8 kHz content using HPF→BPF→LPF processing.
+
+    Args:
+        x: Noise signal to colour.
+        sr: Sample rate associated with ``x``.
+    """
+
+    x = _ensure_array(x)
+    if len(x) == 0 or sr <= 0:
+        return x
+
+    hp_cut = min(_BREATH_NOISE_HPF_CUTOFF_HZ, float(sr) * _NYQUIST_SAFETY)
+    bp_center = float(_BREATH_NOISE_BPF_CENTER_HZ)
+    lp_cut = min(_BREATH_NOISE_LPF_CUTOFF_HZ, float(sr) * _NYQUIST_SAFETY)
+
+    if bp_center >= float(sr) * 0.5:
+        bp_center = float(sr) * _NYQUIST_SAFETY
+
+    y = x
+    b0, b1, b2, a1, a2 = _highpass_biquad_coeff(hp_cut, _BREATH_NOISE_HPF_Q, sr)
+    y = _biquad_process(y, b0, b1, b2, a1, a2)
+
+    b0, b1, b2, a1, a2 = _bandpass_biquad_coeff(bp_center, _BREATH_NOISE_BPF_Q, sr)
+    y = _biquad_process(y, b0, b1, b2, a1, a2)
+
+    b0, b1, b2, a1, a2 = _lowpass_biquad_coeff(lp_cut, _BREATH_NOISE_LPF_Q, sr)
+    y = _biquad_process(y, b0, b1, b2, a1, a2)
+
+    return y.astype(DTYPE, copy=False)
 
 
 def _pre_emphasis(x: np.ndarray, coefficient: float = 0.85) -> np.ndarray:

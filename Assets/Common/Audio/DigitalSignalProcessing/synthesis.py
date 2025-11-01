@@ -121,6 +121,7 @@ def _synth_vowel_fixed(
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
+    breathHnrDb: Optional[float] = None,
     driftCents: float = DEFAULT_DRIFT_CENTS,
     driftReturnRate: float = DEFAULT_DRIFT_RETURN_RATE,
     vibratoDepthCents: float = DEFAULT_VIBRATO_DEPTH_CENTS,
@@ -134,6 +135,32 @@ def _synth_vowel_fixed(
     waveguideLipReflection: float = -0.85,
     waveguideWallLoss: float = 0.996,
 ) -> np.ndarray:
+    """Synthesize a steady-state vowel for the provided tract configuration.
+
+    Args:
+        formants: Target formant frequencies in Hz.
+        bws: Corresponding bandwidths in Hz.
+        f0: Base fundamental frequency in Hz.
+        dur_s: Duration in seconds.
+        sr: Sample rate in Hz.
+        jitterCents: Amount of fast pitch variation in cents.
+        shimmerDb: Amplitude modulation depth in dB.
+        breathLevelDb: Legacy breath level relative to harmonic RMS.
+        breathHnrDb: Optional HNR target used to derive noise gain.
+        driftCents: Slow pitch drift depth in cents.
+        driftReturnRate: Rate at which drift recenters.
+        vibratoDepthCents: Vibrato depth in cents.
+        vibratoFrequencyHz: Vibrato speed in Hz.
+        tremorDepthCents: Tremor depth in cents.
+        tremorFrequencyHz: Tremor speed in Hz.
+        areaProfile: Optional custom area function for Kelly-Lochbaum.
+        articulation: Optional articulation overrides for waveguide.
+        kellySections: Number of waveguide sections to use.
+        useLegacyFormantFilter: Toggle between formant and waveguide model.
+        waveguideLipReflection: Lip reflection coefficient for waveguide.
+        waveguideWallLoss: Wall loss factor for waveguide.
+    """
+
     src = _glottal_source(
         f0,
         dur_s,
@@ -172,7 +199,13 @@ def _synth_vowel_fixed(
             wallLoss=waveguideWallLoss,
             applyRadiation=True,
         )
-    y = _add_breath_noise(y, breathLevelDb)
+    y = _add_breath_noise(
+        y,
+        breathLevelDb,
+        sr,
+        f0_track=f0,
+        hnr_target_db=breathHnrDb,
+    )
     return _normalize_peak(y, PEAK_DEFAULT)
 
 
@@ -184,6 +217,7 @@ def synth_vowel(
     jitterCents: float = 6.0,
     shimmerDb: float = 0.6,
     breathLevelDb: float = -40.0,
+    breathHnrDb: Optional[float] = None,
     *,
     driftCents: float = DEFAULT_DRIFT_CENTS,
     driftReturnRate: float = DEFAULT_DRIFT_RETURN_RATE,
@@ -200,6 +234,32 @@ def synth_vowel(
     waveguideWallLoss: float = 0.996,
     speakerProfile: Optional[SpeakerProfile] = None,
 ) -> np.ndarray:
+    """Synthesize a vowel tone using the requested articulatory settings.
+
+    Args:
+        vowel: Target vowel symbol.
+        f0: Fundamental frequency in Hz.
+        durationSeconds: Output duration in seconds.
+        sampleRate: Rendering sample rate in Hz.
+        jitterCents: Fast pitch jitter amount in cents.
+        shimmerDb: Amplitude jitter in dB.
+        breathLevelDb: Legacy breath gain relative to harmonics.
+        breathHnrDb: Optional HNR target driving breath noise gain.
+        driftCents: Slow pitch drift amount in cents.
+        driftReturnRate: Re-centering rate for pitch drift.
+        vibratoDepthCents: Vibrato depth in cents.
+        vibratoFrequencyHz: Vibrato frequency in Hz.
+        tremorDepthCents: Tremor depth in cents.
+        tremorFrequencyHz: Tremor frequency in Hz.
+        kellyBlend: Blend factor between formant filter and waveguide.
+        articulation: Optional articulation overrides for waveguide.
+        areaProfile: Custom vocal tract area function.
+        kellySections: Number of sections for waveguide.
+        useLegacyFormantFilter: Flag selecting legacy formant filtering.
+        waveguideLipReflection: Lip reflection coefficient for waveguide.
+        waveguideWallLoss: Wall damping factor for waveguide.
+        speakerProfile: Optional speaker profile overrides.
+    """
     assert vowel in VOWEL_TABLE, f"unsupported vowel: {vowel}"
     src = _glottal_source(
         f0,
@@ -300,7 +360,13 @@ def synth_vowel(
             wallLoss=waveguideWallLoss,
             applyRadiation=True,
         )
-    y = _add_breath_noise(y, breathLevelDb)
+    y = _add_breath_noise(
+        y,
+        breathLevelDb,
+        sampleRate,
+        f0_track=f0,
+        hnr_target_db=breathHnrDb,
+    )
     if nasal_leak_depth > EPS and nasal_zeros[0].size > 0:
         y = _apply_nasal_antiresonances(
             y,
@@ -506,6 +572,7 @@ def synth_vowel_with_onset(
     vowel_kwargs.setdefault('jitterCents', 6.0)
     vowel_kwargs.setdefault('shimmerDb', 0.6)
     vowel_kwargs.setdefault('breathLevelDb', -40.0)
+    vowel_kwargs.setdefault('breathHnrDb', None)
     vowel_kwargs.setdefault('driftCents', DEFAULT_DRIFT_CENTS)
     vowel_kwargs.setdefault('driftReturnRate', DEFAULT_DRIFT_RETURN_RATE)
     vowel_kwargs.setdefault('vibratoDepthCents', DEFAULT_VIBRATO_DEPTH_CENTS)
@@ -522,6 +589,7 @@ def synth_vowel_with_onset(
         'jitterCents': vowel_kwargs['jitterCents'],
         'shimmerDb': vowel_kwargs['shimmerDb'],
         'breathLevelDb': vowel_kwargs['breathLevelDb'],
+        'breathHnrDb': vowel_kwargs['breathHnrDb'],
         'driftCents': vowel_kwargs['driftCents'],
         'driftReturnRate': vowel_kwargs['driftReturnRate'],
         'vibratoDepthCents': vowel_kwargs['vibratoDepthCents'],
@@ -602,6 +670,7 @@ def synth_cv(
 
     head = np.zeros(_ms_to_samples(preMilliseconds, sampleRate), dtype=DTYPE)
     vowel_kwargs = dict(vowelModel or {})
+    vowel_kwargs.setdefault('breathHnrDb', None)
     if speakerProfile is not None:
         vowel_kwargs.setdefault('speakerProfile', speakerProfile)
     speaker_profile: Optional[SpeakerProfile] = vowel_kwargs.get('speakerProfile')
@@ -761,7 +830,12 @@ def synth_cv(
             vowelModel=vowel_kwargs,
         )
         out = _pre_emphasis(out, coefficient=0.86)
-        out = _add_breath_noise(out, level_db=-36.0)
+        out = _add_breath_noise(
+            out,
+            level_db=-36.0,
+            sr=sampleRate,
+            f0_track=f0,
+        )
         out = _normalize_peak(out, PEAK_DEFAULT)
 
     elif c == 'y':
@@ -779,7 +853,12 @@ def synth_cv(
             vowelModel=vowel_kwargs,
         )
         out = _pre_emphasis(out, coefficient=0.84)
-        out = _add_breath_noise(out, level_db=-38.0)
+        out = _add_breath_noise(
+            out,
+            level_db=-38.0,
+            sr=sampleRate,
+            f0_track=f0,
+        )
         out = _normalize_peak(out, PEAK_DEFAULT)
 
     elif c == 'r':

@@ -1,5 +1,10 @@
+# Created on 2024-08-28
+# Created by ChatGPT
+# Description: Core numeric helpers shared across the DSP modules.
 """Core numeric helpers shared across the DSP modules."""
 from __future__ import annotations
+
+from typing import Optional, Union
 
 import numpy as np
 
@@ -15,6 +20,10 @@ __all__ = [
     "_apply_fade",
     "_add_breath_noise",
 ]
+
+
+_BREATH_GATE_SHAPE_POWER = 2.0
+_BREATH_GATE_MIN_FREQUENCY = 10.0
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -75,16 +84,96 @@ def _apply_fade(
     return out
 
 
-def _add_breath_noise(sig: np.ndarray, level_db: float) -> np.ndarray:
-    """Add a breath noise component when ``level_db`` is negative."""
-    rng = np.random.default_rng()
+def _add_breath_noise(
+    sig: np.ndarray,
+    level_db: float,
+    sr: Optional[int] = None,
+    *,
+    f0_track: Optional[Union[float, np.ndarray]] = None,
+    hnr_target_db: Optional[float] = None,
+    harmonic: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Add breath noise using HNR and glottal gating when available.
+
+    Args:
+        sig: Harmonic component that receives the noise contribution.
+        level_db: Legacy breath level in dB relative to ``sig`` RMS (negative).
+        sr: Sample rate for noise coloration and gating.
+        f0_track: Fundamental frequency in Hz (scalar or per-sample array).
+        hnr_target_db: Desired harmonic-to-noise ratio in dB.
+        harmonic: Optional reference used to measure harmonic power.
+    """
+
+    def _compute_gate(n_samples: int) -> Optional[np.ndarray]:
+        if sr is None or sr <= 0:
+            return None
+        if f0_track is None:
+            return None
+        if isinstance(f0_track, (int, float)):
+            freqs = np.full(n_samples, float(f0_track), dtype=np.float64)
+        else:
+            arr = np.asarray(f0_track, dtype=np.float64).ravel()
+            if arr.size == 0:
+                return None
+            if arr.size != n_samples:
+                pos = np.linspace(0.0, 1.0, arr.size, endpoint=False, dtype=np.float64)
+                tgt = np.linspace(0.0, 1.0, n_samples, endpoint=False, dtype=np.float64)
+                arr = np.interp(tgt, pos, arr, left=arr[0], right=arr[-1])
+            freqs = arr
+        freqs = np.clip(freqs, 0.0, float(sr) * 0.5)
+        if np.all(freqs <= _BREATH_GATE_MIN_FREQUENCY):
+            return None
+        phase_inc = 2.0 * np.pi * freqs / float(sr)
+        phase = np.cumsum(phase_inc, dtype=np.float64)
+        gate = np.maximum(0.0, np.sin(phase))
+        if np.max(gate) <= EPS:
+            return None
+        shaped = gate ** _BREATH_GATE_SHAPE_POWER
+        peak = float(np.max(shaped))
+        if peak <= EPS:
+            return None
+        return (shaped / peak).astype(DTYPE, copy=False)
+
     sig = _ensure_array(sig)
-    if level_db >= 0 or len(sig) == 0:
+    n = len(sig)
+    if n == 0:
         return sig
-    noise = rng.standard_normal(len(sig)).astype(DTYPE)
-    rms = float(np.sqrt(np.mean(sig * sig) + EPS))
-    target = rms * _db_to_lin(level_db)
-    n_rms = float(np.sqrt(np.mean(noise * noise) + EPS))
-    if n_rms > 0:
-        sig = sig + noise * (target / n_rms)
-    return sig.astype(DTYPE, copy=False)
+
+    rng = np.random.default_rng()
+    noise = rng.standard_normal(n).astype(DTYPE)
+
+    if sr is not None and sr > 0:
+        from .filters import _apply_breath_noise_coloration
+
+        noise = _apply_breath_noise_coloration(noise, sr)
+
+    gate = _compute_gate(n)
+    if gate is not None:
+        noise = noise * gate
+
+    harmonic_ref = _ensure_array(harmonic) if harmonic is not None else sig
+    harmonic_power = float(
+        np.mean(np.asarray(harmonic_ref, dtype=np.float64) ** 2) + EPS
+    )
+
+    target_rms: Optional[float] = None
+    if hnr_target_db is not None and np.isfinite(hnr_target_db):
+        ratio = 10.0 ** (hnr_target_db / 10.0)
+        ratio = max(ratio, EPS)
+        noise_power = harmonic_power / ratio
+        target_rms = float(np.sqrt(max(noise_power, 0.0)))
+    elif level_db < 0.0:
+        harmonic_rms = float(np.sqrt(harmonic_power))
+        target_rms = harmonic_rms * _db_to_lin(level_db)
+
+    if target_rms is None or target_rms <= 0.0:
+        return sig
+
+    noise_rms = float(
+        np.sqrt(np.mean(np.asarray(noise, dtype=np.float64) ** 2) + EPS)
+    )
+    if noise_rms <= 0.0:
+        return sig
+
+    scaled_noise = noise * (target_rms / noise_rms)
+    return (sig + scaled_noise).astype(DTYPE, copy=False)
