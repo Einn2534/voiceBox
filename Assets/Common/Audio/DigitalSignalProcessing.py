@@ -33,6 +33,9 @@ DEFAULT_VIBRATO_DEPTH_CENTS = 0.0
 DEFAULT_VIBRATO_FREQUENCY_HZ = 5.5
 DEFAULT_TREMOR_DEPTH_CENTS = 0.0
 DEFAULT_TREMOR_FREQUENCY_HZ = 8.5
+JITTER_AR_POLE = 0.999
+SHIMMER_DECAY_FREQ_HZ = 800.0
+TWO_PI = 2.0 * pi
 
 
 # =======================
@@ -672,13 +675,13 @@ def _glottal_source(
 
     # jitter（AR一次）
     jn = rng.standard_normal(n).astype(DTYPE)
-    pole = 0.999
+    pole = JITTER_AR_POLE
     js = np.empty_like(jn)
     acc = 0.0
     for i in range(n):
         acc = pole * acc + (1.0 - pole) * jn[i]
         js[i] = acc
-    jitter_semitones = (jitter_cents / 100.0) * js
+    jitter_cents_series = float(jitter_cents) * js.astype(np.float64)
 
     drift = np.zeros(n, dtype=DTYPE)
     if drift_cents > 0.0 and drift_return_rate > 0.0:
@@ -690,36 +693,36 @@ def _glottal_source(
         for i in range(n):
             state += theta * (-state) * dt + sigma * sqrt_dt * rng.standard_normal()
             drift[i] = state
-    drift_semitones = drift / 100.0
+    drift_cents_series = drift.astype(np.float64)
 
     t = np.arange(n, dtype=np.float64) / float(sr)
-    vibrato_semitones = np.zeros(n, dtype=np.float64)
+    vibrato_cents = np.zeros(n, dtype=np.float64)
     if vibrato_depth_cents != 0.0 and vibrato_frequency_hz > 0.0:
-        vib_phase = rng.uniform(0.0, 2.0 * pi)
-        vibrato_semitones = (
-            (vibrato_depth_cents / 100.0)
-            * np.sin(2.0 * pi * vibrato_frequency_hz * t + vib_phase)
+        vib_phase = rng.uniform(0.0, TWO_PI)
+        vibrato_cents = (
+            float(vibrato_depth_cents)
+            * np.sin(TWO_PI * float(vibrato_frequency_hz) * t + vib_phase)
         )
 
-    tremor_semitones = np.zeros(n, dtype=np.float64)
+    tremor_cents = np.zeros(n, dtype=np.float64)
     if tremor_depth_cents != 0.0 and tremor_frequency_hz > 0.0:
-        tremor_phase = rng.uniform(0.0, 2.0 * pi)
-        tremor_semitones = (
-            (tremor_depth_cents / 100.0)
-            * np.sin(2.0 * pi * tremor_frequency_hz * t + tremor_phase)
+        tremor_phase = rng.uniform(0.0, TWO_PI)
+        tremor_cents = (
+            float(tremor_depth_cents)
+            * np.sin(TWO_PI * float(tremor_frequency_hz) * t + tremor_phase)
         )
 
-    composite_semitones = (
-        jitter_semitones.astype(np.float64)
-        + drift_semitones.astype(np.float64)
-        + vibrato_semitones
-        + tremor_semitones
+    composite_cents = (
+        jitter_cents_series
+        + drift_cents_series
+        + vibrato_cents
+        + tremor_cents
     )
-    inst_f = f0 * (2.0 ** (composite_semitones / 12.0))
+    inst_f = float(f0) * (2.0 ** (composite_cents / 1200.0))
 
     # 位相加算で鋸波
-    phase = np.cumsum(2.0 * pi * inst_f / sr, dtype=np.float64)
-    saw = (2.0 * ((phase / (2.0 * pi)) % 1.0) - 1.0).astype(DTYPE)
+    phase = np.cumsum(TWO_PI * inst_f / float(sr), dtype=np.float64)
+    saw = (2.0 * ((phase / TWO_PI) % 1.0) - 1.0).astype(DTYPE)
 
     # shimmer（AR一次）
     sn = rng.standard_normal(n).astype(DTYPE)
@@ -733,7 +736,7 @@ def _glottal_source(
     raw = saw * amp
 
     # 簡易 HP 抑制
-    decay = exp(-2.0 * pi * 800.0 / sr)
+    decay = exp(-TWO_PI * SHIMMER_DECAY_FREQ_HZ / float(sr))
     y = np.empty_like(raw)
     s = 0.0
     for i in range(n):
