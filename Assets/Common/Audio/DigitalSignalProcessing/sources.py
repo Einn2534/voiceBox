@@ -117,8 +117,15 @@ def _glottal_source(
     amplitude_ou_sigma: float = DEFAULT_AM_OU_SIGMA,
     amplitude_ou_tau: float = DEFAULT_AM_OU_TAU,
     amplitude_ou_clip_multiple: float = DEFAULT_AM_OU_CLIP_MULTIPLE,
+    frequency_multiplier: Optional[np.ndarray] = None,
+    amplitude_multiplier: Optional[np.ndarray] = None,
 ) -> GlottalSourceResult:
-    """Saw-like glottal source enriched with humanising modulations."""
+    """Saw-like glottal source enriched with humanising modulations.
+
+    Args:
+        frequency_multiplier: Optional per-sample frequency scalars.
+        amplitude_multiplier: Optional per-sample amplitude scalars.
+    """
 
     rng = np.random.default_rng()
     n = max(0, int(dur_s * sr))
@@ -172,6 +179,14 @@ def _glottal_source(
         + tremor_semitones
     )
     inst_f = f0 * (2.0 ** (composite_semitones / 12.0))
+    if frequency_multiplier is not None and inst_f.size > 0:
+        freq_track = np.asarray(frequency_multiplier, dtype=np.float64)
+        if freq_track.size != n and n > 0 and freq_track.size > 0:
+            src_pos = np.linspace(0.0, 1.0, freq_track.size, dtype=np.float64, endpoint=False)
+            dst_pos = np.linspace(0.0, 1.0, n, dtype=np.float64, endpoint=False)
+            freq_track = np.interp(dst_pos, src_pos, freq_track)
+        if freq_track.size == n:
+            inst_f = inst_f * freq_track
 
     phase = np.cumsum(2.0 * pi * inst_f / sr, dtype=np.float64)
     saw = (2.0 * ((phase / (2.0 * pi)) % 1.0) - 1.0).astype(np.float64)
@@ -199,6 +214,14 @@ def _glottal_source(
         )
 
     amplitude_envelope = shimmer_track * amp_ou * tremolo
+    if amplitude_multiplier is not None and amplitude_envelope.size > 0:
+        amp_track = np.asarray(amplitude_multiplier, dtype=np.float64)
+        if amp_track.size != n and n > 0 and amp_track.size > 0:
+            src_pos = np.linspace(0.0, 1.0, amp_track.size, dtype=np.float64, endpoint=False)
+            dst_pos = np.linspace(0.0, 1.0, n, dtype=np.float64, endpoint=False)
+            amp_track = np.interp(dst_pos, src_pos, amp_track)
+        if amp_track.size == n:
+            amplitude_envelope = amplitude_envelope * amp_track
     raw = saw * amplitude_envelope
 
     decay = exp(-2.0 * pi * _GLOTTAL_LP_CUTOFF_HZ / sr)

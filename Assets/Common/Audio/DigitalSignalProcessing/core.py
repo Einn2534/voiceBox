@@ -19,11 +19,28 @@ __all__ = [
     "_normalize_peak",
     "_apply_fade",
     "_add_breath_noise",
+    "_soft_limit",
 ]
 
 
 _BREATH_GATE_SHAPE_POWER = 2.0
 _BREATH_GATE_MIN_FREQUENCY = 10.0
+_SOFT_LIMIT_MIN_DRIVE_DB = -24.0
+_SOFT_LIMIT_MAX_DRIVE_DB = 24.0
+
+
+def _soft_limit(sig: np.ndarray, drive_db: float = 0.0) -> np.ndarray:
+    """Apply an arctangent soft limiter with configurable drive."""
+
+    sig = _ensure_array(sig)
+    if sig.size == 0:
+        return sig
+
+    drive_db = float(np.clip(drive_db, _SOFT_LIMIT_MIN_DRIVE_DB, _SOFT_LIMIT_MAX_DRIVE_DB))
+    drive = 10.0 ** (drive_db / 20.0)
+    driven = drive * sig
+    limited = np.arctan(driven) / np.arctan(drive)
+    return limited.astype(DTYPE, copy=False)
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
