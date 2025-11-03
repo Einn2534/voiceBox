@@ -81,6 +81,10 @@ class TokenProsody:
     overlapMilliseconds: Optional[float] = None
     gapMilliseconds: Optional[float] = None
     durationScale: Optional[float] = None
+    f0MultiplierTrack: Optional[Sequence[float]] = None
+    amplitudeMultiplierTrack: Optional[Sequence[float]] = None
+    formantOffsetTrack: Optional[Sequence[Sequence[float]]] = None
+    breathLevelOffsetTrack: Optional[Sequence[float]] = None
 
 
 _MIN_VOWEL_DURATION_MS = 120.0
@@ -119,6 +123,7 @@ _CONSONANT_BASE_DURATION_MS: Dict[str, float] = {
 
 __all__ = [
     "DynamicControl",
+    "LowRateControlTargets",
     "TokenProsody",
     "synth_vowel",
     "synth_fricative",
@@ -142,6 +147,16 @@ class DynamicControl:
     amplitudeMultiplier: Optional[np.ndarray] = None
     formantOffsetHz: Optional[np.ndarray] = None
     breathLevelOffsetDb: float = 0.0
+
+
+@dataclass(frozen=True)
+class LowRateControlTargets:
+    """Target trajectories anchoring the stochastic low-rate controller."""
+
+    f0Multiplier: Optional[Sequence[float]] = None
+    amplitudeMultiplier: Optional[Sequence[float]] = None
+    formantOffsetHz: Optional[Sequence[Sequence[float]]] = None
+    breathLevelOffsetDb: Optional[Sequence[float]] = None
 
 
 _CONTROL_FRAME_RATE_HZ = 200.0
@@ -236,6 +251,50 @@ def _apply_amplitude_control(segment: np.ndarray, control: Optional[DynamicContr
     return scaled.astype(DTYPE, copy=False)
 
 
+def _ensure_1d_array(values: Sequence[float]) -> np.ndarray:
+    """Return ``values`` as a 1D float64 ``ndarray`` for interpolation helpers."""
+
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 0:
+        return np.array([float(arr)], dtype=np.float64)
+    return arr.reshape(-1).astype(np.float64, copy=False)
+
+
+def _normalize_formant_targets(values: Sequence[Sequence[float]]) -> np.ndarray:
+    """Coerce formant target sequences to a 2D float64 array."""
+
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 0:
+        return np.array([[float(arr)]], dtype=np.float64)
+    if arr.ndim == 1:
+        return arr[np.newaxis, :].astype(np.float64, copy=False)
+    if arr.ndim == 2:
+        return arr.astype(np.float64, copy=False)
+    raise ValueError("Formant targets must be 1D or 2D sequences")
+
+
+def _prosody_to_control_targets(prosody: TokenProsody) -> Optional[LowRateControlTargets]:
+    """Derive low-rate control targets from ``prosody`` when available."""
+
+    has_targets = any(
+        value is not None
+        for value in (
+            prosody.f0MultiplierTrack,
+            prosody.amplitudeMultiplierTrack,
+            prosody.formantOffsetTrack,
+            prosody.breathLevelOffsetTrack,
+        )
+    )
+    if not has_targets:
+        return None
+    return LowRateControlTargets(
+        f0Multiplier=prosody.f0MultiplierTrack,
+        amplitudeMultiplier=prosody.amplitudeMultiplierTrack,
+        formantOffsetHz=prosody.formantOffsetTrack,
+        breathLevelOffsetDb=prosody.breathLevelOffsetTrack,
+    )
+
+
 class _LowRateControlGenerator:
     """Generate smooth 200 Hz control trajectories for synthesis parameters."""
 
@@ -283,7 +342,14 @@ class _LowRateControlGenerator:
             series[index] = current
         return series, current
 
-    def next(self, sampleCount: int, sampleRate: int, formantCount: int) -> DynamicControl:
+    def next(
+        self,
+        sampleCount: int,
+        sampleRate: int,
+        formantCount: int,
+        *,
+        targets: Optional[LowRateControlTargets] = None,
+    ) -> DynamicControl:
         """Return per-sample control tracks for the requested segment."""
 
         sampleCount = int(max(sampleCount, 0))
@@ -334,7 +400,59 @@ class _LowRateControlGenerator:
         frame_positions = np.linspace(0.0, 1.0, frame_count, dtype=np.float64, endpoint=True)
         sample_positions = np.linspace(0.0, 1.0, sampleCount, dtype=np.float64, endpoint=False)
 
-        f0_track = np.interp(sample_positions, frame_positions, f0_series[:, 0])
+        target_f0_track: Optional[np.ndarray] = None
+        target_amp_track: Optional[np.ndarray] = None
+        target_formant_track: Optional[np.ndarray] = None
+        target_breath_track: Optional[np.ndarray] = None
+
+        if targets is not None:
+            if targets.f0Multiplier is not None:
+                raw_f0_target = _match_control_track(
+                    _ensure_1d_array(targets.f0Multiplier),
+                    frame_count,
+                )
+                if raw_f0_target is not None:
+                    clamped = np.clip(
+                        raw_f0_target.astype(np.float64, copy=False),
+                        _CONTROL_MIN_F0_MULT,
+                        _CONTROL_MAX_F0_MULT,
+                    )
+                    with np.errstate(divide='ignore'):
+                        target_f0_track = 1200.0 * np.log2(clamped)
+
+            if targets.amplitudeMultiplier is not None:
+                raw_amp_target = _match_control_track(
+                    _ensure_1d_array(targets.amplitudeMultiplier),
+                    frame_count,
+                )
+                if raw_amp_target is not None:
+                    clamped = np.clip(
+                        raw_amp_target.astype(np.float64, copy=False),
+                        _CONTROL_MIN_AMP,
+                        _CONTROL_MAX_AMP,
+                    )
+                    with np.errstate(divide='ignore'):
+                        target_amp_track = 20.0 * np.log10(np.maximum(clamped, EPS))
+
+            if targets.formantOffsetHz is not None:
+                normalized = _normalize_formant_targets(targets.formantOffsetHz)
+                raw_formant = _match_control_track(normalized, frame_count)
+                if raw_formant is not None:
+                    target_formant_track = raw_formant.astype(np.float64, copy=False)
+
+            if targets.breathLevelOffsetDb is not None:
+                raw_breath = _match_control_track(
+                    _ensure_1d_array(targets.breathLevelOffsetDb),
+                    frame_count,
+                )
+                if raw_breath is not None:
+                    target_breath_track = raw_breath.astype(np.float64, copy=False)
+
+        frame_f0_track = f0_series[:, 0]
+        if target_f0_track is not None:
+            frame_f0_track = frame_f0_track + target_f0_track
+
+        f0_track = np.interp(sample_positions, frame_positions, frame_f0_track)
         f0_track = _smooth_control_track(f0_track, sampleRate, self.smoothingMs)
         f0_multiplier = np.clip(
             2.0 ** (f0_track / 1200.0),
@@ -342,7 +460,11 @@ class _LowRateControlGenerator:
             _CONTROL_MAX_F0_MULT,
         )
 
-        amp_track = np.interp(sample_positions, frame_positions, amp_series[:, 0])
+        frame_amp_track = amp_series[:, 0]
+        if target_amp_track is not None:
+            frame_amp_track = frame_amp_track + target_amp_track
+
+        amp_track = np.interp(sample_positions, frame_positions, frame_amp_track)
         amp_track = _smooth_control_track(amp_track, sampleRate, self.smoothingMs)
         amp_multiplier = np.clip(
             10.0 ** (amp_track / 20.0),
@@ -350,12 +472,27 @@ class _LowRateControlGenerator:
             _CONTROL_MAX_AMP,
         )
 
+        frame_formant_series = formant_series[:, :active_formant_count]
+        if target_formant_track is not None:
+            if target_formant_track.ndim == 1:
+                target_formant_track = target_formant_track[:, None]
+            if target_formant_track.shape[1] < active_formant_count:
+                pad_width = active_formant_count - target_formant_track.shape[1]
+                target_formant_track = np.pad(
+                    target_formant_track,
+                    ((0, 0), (0, pad_width)),
+                    mode='edge',
+                )
+            elif target_formant_track.shape[1] > active_formant_count:
+                target_formant_track = target_formant_track[:, :active_formant_count]
+            frame_formant_series = frame_formant_series + target_formant_track
+
         formant_interp = np.empty((sampleCount, active_formant_count), dtype=np.float64)
         for column in range(active_formant_count):
             interp_column = np.interp(
                 sample_positions,
                 frame_positions,
-                formant_series[:, column],
+                frame_formant_series[:, column],
             )
             formant_interp[:, column] = _smooth_control_track(
                 interp_column,
@@ -363,7 +500,11 @@ class _LowRateControlGenerator:
                 self.smoothingMs,
             )
 
-        breath_interp = np.interp(sample_positions, frame_positions, breath_series[:, 0])
+        frame_breath_track = breath_series[:, 0]
+        if target_breath_track is not None:
+            frame_breath_track = frame_breath_track + target_breath_track
+
+        breath_interp = np.interp(sample_positions, frame_positions, frame_breath_track)
         breath_interp = _smooth_control_track(breath_interp, sampleRate, self.smoothingMs)
         breath_offset_db = float(np.mean(breath_interp)) if breath_interp.size > 0 else 0.0
 
@@ -1651,6 +1792,7 @@ def synth_token_sequence(
     vowelModel: Optional[Dict[str, Any]] = None,
     speakerProfile: Optional[SpeakerProfile] = None,
     tokenProsody: Optional[Sequence[Optional[TokenProsody]]] = None,
+    tokenControlTargets: Optional[Sequence[Optional[LowRateControlTargets]]] = None,
     phraseDurationScaleBounds: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> np.ndarray:
     """Synthesize a token sequence with optional per-token prosody overrides.
@@ -1666,6 +1808,7 @@ def synth_token_sequence(
         vowelModel: Optional vowel synthesis overrides.
         speakerProfile: Speaker profile used for nasal coupling and timbre.
         tokenProsody: Optional overrides for pitch and timing per token index.
+        tokenControlTargets: Optional low-rate control targets per token.
         phraseDurationScaleBounds: Optional per-phrase (start, end) duration scales.
     """
 
@@ -1696,6 +1839,12 @@ def synth_token_sequence(
 
         phrase_scale = phrase_scale_lookup.get(idx, 1.0)
 
+        control_targets: Optional[LowRateControlTargets] = None
+        if tokenControlTargets is not None and idx < len(tokenControlTargets):
+            control_targets = tokenControlTargets[idx]
+        if control_targets is None and prosody is not None:
+            control_targets = _prosody_to_control_targets(prosody)
+
         if t == PAUSE_TOKEN:
             pause_ms = max(default_gap_ms * _PAUSE_MULTIPLIER, _MIN_PAUSE_DURATION_MS)
             if prosody is not None:
@@ -1710,7 +1859,12 @@ def synth_token_sequence(
                     pause_ms = max(0.0, float(prosody.gapMilliseconds))
             pause_ms *= phrase_scale
             pause_samples = max(1, _ms_to_samples(int(round(pause_ms)), sampleRate))
-            control = control_generator.next(pause_samples, sampleRate, _CONTROL_FORMANT_COUNT)
+            control = control_generator.next(
+                pause_samples,
+                sampleRate,
+                _CONTROL_FORMANT_COUNT,
+                targets=control_targets,
+            )
             pause_seg = _synth_pause_with_inhale(pause_ms, sampleRate, rng)
             pause_seg = _apply_amplitude_control(pause_seg, control)
             segs.append(pause_seg)
@@ -1768,7 +1922,12 @@ def synth_token_sequence(
             if pre_ms is not None:
                 expected_ms += float(pre_ms)
             expected_samples = max(1, _ms_to_samples(int(round(expected_ms)), sampleRate))
-            control = control_generator.next(expected_samples, sampleRate, _CONTROL_FORMANT_COUNT)
+            control = control_generator.next(
+                expected_samples,
+                sampleRate,
+                _CONTROL_FORMANT_COUNT,
+                targets=control_targets,
+            )
             control_f0_scale = 1.0
             if control.f0Multiplier is not None and control.f0Multiplier.size > 0:
                 control_f0_scale = float(np.clip(np.mean(control.f0Multiplier), _CONTROL_MIN_F0_MULT, _CONTROL_MAX_F0_MULT))
@@ -1794,7 +1953,12 @@ def synth_token_sequence(
             seg = _apply_amplitude_control(seg, control)
 
         elif t in VOWEL_TABLE:
-            control = control_generator.next(expected_samples, sampleRate, _CONTROL_FORMANT_COUNT)
+            control = control_generator.next(
+                expected_samples,
+                sampleRate,
+                _CONTROL_FORMANT_COUNT,
+                targets=control_targets,
+            )
             token_vowel_kwargs = dict(vowel_kwargs)
             seg = synth_vowel(
                 t,
@@ -1813,7 +1977,12 @@ def synth_token_sequence(
             if consonant_ms is not None:
                 nasal_ms = max(_MIN_NASAL_DURATION_MS, int(round(consonant_ms)))
             expected_samples = max(1, _ms_to_samples(nasal_ms, sampleRate))
-            control = control_generator.next(expected_samples, sampleRate, _CONTROL_FORMANT_COUNT)
+            control = control_generator.next(
+                expected_samples,
+                sampleRate,
+                _CONTROL_FORMANT_COUNT,
+                targets=control_targets,
+            )
             seg = synth_nasal(
                 NASAL_TOKEN_MAP[t],
                 f0=token_f0,
@@ -1852,6 +2021,7 @@ def synth_tokens_to_wav(
     vowelModel: Optional[Dict[str, Any]] = None,
     speakerProfile: Optional[SpeakerProfile] = None,
     tokenProsody: Optional[Sequence[Optional[TokenProsody]]] = None,
+    tokenControlTargets: Optional[Sequence[Optional[LowRateControlTargets]]] = None,
     phraseDurationScaleBounds: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> str:
     """Render a token sequence to disk while allowing per-token prosody overrides.
@@ -1868,6 +2038,7 @@ def synth_tokens_to_wav(
         vowelModel: Optional vowel synthesis overrides.
         speakerProfile: Speaker profile used for nasal coupling and timbre.
         tokenProsody: Optional overrides for pitch and timing per token index.
+        tokenControlTargets: Optional low-rate control targets per token.
         phraseDurationScaleBounds: Optional per-phrase (start, end) duration scales.
     """
 
@@ -1882,6 +2053,7 @@ def synth_tokens_to_wav(
         vowelModel=vowelModel,
         speakerProfile=speakerProfile,
         tokenProsody=tokenProsody,
+        tokenControlTargets=tokenControlTargets,
         phraseDurationScaleBounds=phraseDurationScaleBounds,
     )
     return write_wav(outPath, y, sampleRate=sampleRate)
