@@ -12,6 +12,11 @@ from .constants import (
     NasalCoupling,
     SpeakerProfile,
 )
+from .HumanizationProgram import (
+    HumanizationProgram,
+    build_humanization_program,
+    list_available_programs,
+)
 from .synthesis import (
     synth_affricate,
     synth_cv,
@@ -24,6 +29,7 @@ from .synthesis import (
     synth_tokens_to_wav,
     synth_vowel,
     synth_vowel_with_onset,
+    synth_vowel_with_program,
 )
 from .text import normalize_token_sequence, text_to_tokens
 from .io import write_wav
@@ -40,7 +46,11 @@ __all__ = [
     "SpeakerProfile",
     "text_to_tokens",
     "normalize_token_sequence",
+    "HumanizationProgram",
+    "build_humanization_program",
+    "list_available_programs",
     "synth_vowel",
+    "synth_vowel_with_program",
     "synth_fricative",
     "synth_plosive",
     "synth_affricate",
