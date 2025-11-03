@@ -84,7 +84,9 @@ class TokenProsody:
     f0MultiplierTrack: Optional[Sequence[float]] = None
     amplitudeMultiplierTrack: Optional[Sequence[float]] = None
     formantOffsetTrack: Optional[Sequence[Sequence[float]]] = None
+    formantTargetTrack: Optional[Sequence[Sequence[float]]] = None
     breathLevelOffsetTrack: Optional[Sequence[float]] = None
+    breathHnrTrack: Optional[Sequence[float]] = None
 
 
 _MIN_VOWEL_DURATION_MS = 120.0
@@ -148,7 +150,9 @@ class DynamicControl:
     f0Multiplier: Optional[np.ndarray] = None
     amplitudeMultiplier: Optional[np.ndarray] = None
     formantOffsetHz: Optional[np.ndarray] = None
-    breathLevelOffsetDb: float = 0.0
+    formantTargetHz: Optional[np.ndarray] = None
+    breathLevelOffsetDb: Optional[np.ndarray] = None
+    breathHnrOffsetDb: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)
@@ -160,7 +164,9 @@ class FrameControlFrame:
     f0Multiplier: float
     amplitudeMultiplier: float
     formantOffsetHz: np.ndarray
+    formantTargetHz: np.ndarray
     breathLevelOffsetDb: float
+    breathHnrOffsetDb: float
 
 
 @dataclass(frozen=True)
@@ -179,7 +185,9 @@ class LowRateControlTargets:
     f0Multiplier: Optional[Sequence[float]] = None
     amplitudeMultiplier: Optional[Sequence[float]] = None
     formantOffsetHz: Optional[Sequence[Sequence[float]]] = None
+    formantTargetHz: Optional[Sequence[Sequence[float]]] = None
     breathLevelOffsetDb: Optional[Sequence[float]] = None
+    breathHnrOffsetDb: Optional[Sequence[float]] = None
 
 
 _CONTROL_FRAME_RATE_HZ = 200.0
@@ -197,6 +205,9 @@ _CONTROL_FORMANT_CLIP_MULTIPLE = 3.0
 _CONTROL_BREATH_SIGMA_DB = 2.4
 _CONTROL_BREATH_TAU_MS = 320.0
 _CONTROL_BREATH_CLIP_MULTIPLE = 3.5
+_CONTROL_HNR_SIGMA_DB = 2.0
+_CONTROL_HNR_TAU_MS = 340.0
+_CONTROL_HNR_CLIP_MULTIPLE = 3.0
 _CONTROL_MIN_AMP = 0.35
 _CONTROL_MAX_AMP = 2.6
 _CONTROL_MIN_F0_MULT = 0.6
@@ -284,11 +295,27 @@ def _build_frame_control_plan(
     elif formant_track.ndim == 1:
         formant_track = formant_track[:, None]
 
+    formant_target_track = _match_control_track(control.formantTargetHz, sample_count)
+    if formant_target_track is None:
+        formant_target_track = np.zeros((sample_count, max(formant_count, 1)), dtype=np.float64)
+    elif formant_target_track.ndim == 1:
+        formant_target_track = formant_target_track[:, None]
+
     active_formants = max(0, min(int(formant_count), formant_track.shape[1]))
     if active_formants == 0:
         formant_track = np.zeros((sample_count, 0), dtype=np.float64)
+        formant_target_track = np.zeros((sample_count, 0), dtype=np.float64)
     else:
         formant_track = formant_track[:, :active_formants]
+        formant_target_track = formant_target_track[:, :active_formants]
+
+    breath_track = _match_control_track(control.breathLevelOffsetDb, sample_count)
+    if breath_track is None:
+        breath_track = np.zeros(sample_count, dtype=np.float64)
+
+    hnr_track = _match_control_track(control.breathHnrOffsetDb, sample_count)
+    if hnr_track is None:
+        hnr_track = np.zeros(sample_count, dtype=np.float64)
 
     frames: List[FrameControlFrame] = []
     for start in range(0, sample_count, frame_length):
@@ -300,8 +327,12 @@ def _build_frame_control_plan(
         frame_amp = float(np.mean(amp_track[frame_slice]))
         if formant_track.size > 0:
             frame_formant = np.mean(formant_track[frame_slice, :], axis=0)
+            frame_formant_targets = np.mean(formant_target_track[frame_slice, :], axis=0)
         else:
             frame_formant = np.zeros((0,), dtype=np.float64)
+            frame_formant_targets = np.zeros((0,), dtype=np.float64)
+        frame_breath_offset = float(np.mean(breath_track[frame_slice]))
+        frame_hnr_offset = float(np.mean(hnr_track[frame_slice]))
         frames.append(
             FrameControlFrame(
                 startSample=int(start),
@@ -309,7 +340,9 @@ def _build_frame_control_plan(
                 f0Multiplier=frame_f0,
                 amplitudeMultiplier=frame_amp,
                 formantOffsetHz=frame_formant.astype(np.float64, copy=False),
-                breathLevelOffsetDb=float(control.breathLevelOffsetDb),
+                formantTargetHz=frame_formant_targets.astype(np.float64, copy=False),
+                breathLevelOffsetDb=frame_breath_offset,
+                breathHnrOffsetDb=frame_hnr_offset,
             )
         )
 
@@ -385,7 +418,9 @@ def _prosody_to_control_targets(prosody: TokenProsody) -> Optional[LowRateContro
             prosody.f0MultiplierTrack,
             prosody.amplitudeMultiplierTrack,
             prosody.formantOffsetTrack,
+            prosody.formantTargetTrack,
             prosody.breathLevelOffsetTrack,
+            prosody.breathHnrTrack,
         )
     )
     if not has_targets:
@@ -394,7 +429,9 @@ def _prosody_to_control_targets(prosody: TokenProsody) -> Optional[LowRateContro
         f0Multiplier=prosody.f0MultiplierTrack,
         amplitudeMultiplier=prosody.amplitudeMultiplierTrack,
         formantOffsetHz=prosody.formantOffsetTrack,
+        formantTargetHz=prosody.formantTargetTrack,
         breathLevelOffsetDb=prosody.breathLevelOffsetTrack,
+        breathHnrOffsetDb=prosody.breathHnrTrack,
     )
 
 
@@ -500,13 +537,24 @@ class _LowRateControlGenerator:
         )
         self.formantState[:active_formant_count] = formant_next[-1]
 
+        hnr_series, hnr_state = self._ou_series(
+            frame_count,
+            _CONTROL_HNR_TAU_MS,
+            _CONTROL_HNR_SIGMA_DB,
+            np.array([self.hnrState], dtype=np.float64),
+            _CONTROL_HNR_CLIP_MULTIPLE,
+        )
+        self.hnrState = float(hnr_state[-1])
+
         frame_positions = np.linspace(0.0, 1.0, frame_count, dtype=np.float64, endpoint=True)
         sample_positions = np.linspace(0.0, 1.0, sampleCount, dtype=np.float64, endpoint=False)
 
         target_f0_track: Optional[np.ndarray] = None
         target_amp_track: Optional[np.ndarray] = None
         target_formant_track: Optional[np.ndarray] = None
+        target_formant_absolute: Optional[np.ndarray] = None
         target_breath_track: Optional[np.ndarray] = None
+        target_hnr_track: Optional[np.ndarray] = None
 
         if targets is not None:
             if targets.f0Multiplier is not None:
@@ -543,6 +591,12 @@ class _LowRateControlGenerator:
                 if raw_formant is not None:
                     target_formant_track = raw_formant.astype(np.float64, copy=False)
 
+            if targets.formantTargetHz is not None:
+                normalized = _normalize_formant_targets(targets.formantTargetHz)
+                raw_absolute = _match_control_track(normalized, frame_count)
+                if raw_absolute is not None:
+                    target_formant_absolute = raw_absolute.astype(np.float64, copy=False)
+
             if targets.breathLevelOffsetDb is not None:
                 raw_breath = _match_control_track(
                     _ensure_1d_array(targets.breathLevelOffsetDb),
@@ -550,6 +604,14 @@ class _LowRateControlGenerator:
                 )
                 if raw_breath is not None:
                     target_breath_track = raw_breath.astype(np.float64, copy=False)
+
+            if targets.breathHnrOffsetDb is not None:
+                raw_hnr = _match_control_track(
+                    _ensure_1d_array(targets.breathHnrOffsetDb),
+                    frame_count,
+                )
+                if raw_hnr is not None:
+                    target_hnr_track = raw_hnr.astype(np.float64, copy=False)
 
         frame_f0_track = f0_series[:, 0]
         if target_f0_track is not None:
@@ -603,23 +665,68 @@ class _LowRateControlGenerator:
                 self.smoothingMs,
             )
 
+        formant_absolute_interp: Optional[np.ndarray] = None
+        if target_formant_absolute is not None:
+            if target_formant_absolute.ndim == 1:
+                target_formant_absolute = target_formant_absolute[:, None]
+            if target_formant_absolute.shape[1] < active_formant_count:
+                pad_width = active_formant_count - target_formant_absolute.shape[1]
+                target_formant_absolute = np.pad(
+                    target_formant_absolute,
+                    ((0, 0), (0, pad_width)),
+                    mode='edge',
+                )
+            elif target_formant_absolute.shape[1] > active_formant_count:
+                target_formant_absolute = target_formant_absolute[:, :active_formant_count]
+            formant_absolute_interp = np.empty((sampleCount, active_formant_count), dtype=np.float64)
+            for column in range(active_formant_count):
+                interp_column = np.interp(
+                    sample_positions,
+                    frame_positions,
+                    target_formant_absolute[:, column],
+                )
+                formant_absolute_interp[:, column] = _smooth_control_track(
+                    interp_column,
+                    sampleRate,
+                    self.smoothingMs,
+                )
+
         frame_breath_track = breath_series[:, 0]
         if target_breath_track is not None:
             frame_breath_track = frame_breath_track + target_breath_track
 
         breath_interp = np.interp(sample_positions, frame_positions, frame_breath_track)
         breath_interp = _smooth_control_track(breath_interp, sampleRate, self.smoothingMs)
-        breath_offset_db = float(np.mean(breath_interp)) if breath_interp.size > 0 else 0.0
+
+        frame_hnr_track = hnr_series[:, 0]
+        if target_hnr_track is not None:
+            frame_hnr_track = frame_hnr_track + target_hnr_track
+
+        hnr_interp = np.interp(sample_positions, frame_positions, frame_hnr_track)
+        hnr_interp = _smooth_control_track(hnr_interp, sampleRate, self.smoothingMs)
 
         if active_formant_count < _CONTROL_FORMANT_COUNT:
             pad_width = _CONTROL_FORMANT_COUNT - active_formant_count
             formant_interp = np.pad(formant_interp, ((0, 0), (0, pad_width)), mode='constant')
+            if formant_absolute_interp is None:
+                formant_absolute_interp = np.zeros_like(formant_interp)
+            else:
+                formant_absolute_interp = np.pad(
+                    formant_absolute_interp,
+                    ((0, 0), (0, pad_width)),
+                    mode='constant',
+                )
+
+        if formant_absolute_interp is None:
+            formant_absolute_interp = np.zeros_like(formant_interp)
 
         return DynamicControl(
             f0Multiplier=f0_multiplier.astype(np.float64, copy=False),
             amplitudeMultiplier=amp_multiplier.astype(np.float64, copy=False),
             formantOffsetHz=formant_interp.astype(np.float64, copy=False),
-            breathLevelOffsetDb=breath_offset_db,
+            formantTargetHz=formant_absolute_interp.astype(np.float64, copy=False),
+            breathLevelOffsetDb=breath_interp.astype(np.float64, copy=False),
+            breathHnrOffsetDb=hnr_interp.astype(np.float64, copy=False),
         )
 
 
@@ -1010,11 +1117,19 @@ def _synth_vowel_fixed(
     amp_multiplier: Optional[np.ndarray] = None
     formant_offset_track: Optional[np.ndarray] = None
     breath_offset_db = 0.0
+    breath_hnr_offset_db = 0.0
+    formant_absolute_track: Optional[np.ndarray] = None
     if dynamicControls is not None:
         freq_multiplier = _match_control_track(dynamicControls.f0Multiplier, sample_count)
         amp_multiplier = _match_control_track(dynamicControls.amplitudeMultiplier, sample_count)
         formant_offset_track = _match_control_track(dynamicControls.formantOffsetHz, sample_count)
-        breath_offset_db = float(dynamicControls.breathLevelOffsetDb)
+        formant_absolute_track = _match_control_track(dynamicControls.formantTargetHz, sample_count)
+        breath_track = _match_control_track(dynamicControls.breathLevelOffsetDb, sample_count)
+        breath_hnr_track = _match_control_track(dynamicControls.breathHnrOffsetDb, sample_count)
+        if breath_track is not None and breath_track.size > 0:
+            breath_offset_db = float(np.mean(breath_track))
+        if breath_hnr_track is not None and breath_hnr_track.size > 0:
+            breath_hnr_offset_db = float(np.mean(breath_hnr_track))
         if freq_multiplier is not None:
             freq_multiplier = np.clip(freq_multiplier, _CONTROL_MIN_F0_MULT, _CONTROL_MAX_F0_MULT)
         if amp_multiplier is not None:
@@ -1063,6 +1178,19 @@ def _synth_vowel_fixed(
             formantOuPhase,
             external_offsets=formant_offset_track,
         )
+        if formant_absolute_track is not None and formant_absolute_track.size > 0:
+            if formant_absolute_track.ndim == 1:
+                formant_absolute_track = formant_absolute_track[:, None]
+            if formant_absolute_track.shape[1] < freq_targets.shape[1]:
+                pad_width = freq_targets.shape[1] - formant_absolute_track.shape[1]
+                formant_absolute_track = np.pad(
+                    formant_absolute_track,
+                    ((0, 0), (0, pad_width)),
+                    mode='edge',
+                )
+            elif formant_absolute_track.shape[1] > freq_targets.shape[1]:
+                formant_absolute_track = formant_absolute_track[:, : freq_targets.shape[1]]
+            freq_targets = formant_absolute_track
         y = _apply_formant_filters(src, freq_targets, bw_targets, sr)
     else:
         sections = int(kellySections) if kellySections else len(_NEUTRAL_TRACT_AREA_CM2)
@@ -1086,12 +1214,21 @@ def _synth_vowel_fixed(
             applyRadiation=True,
         )
     effective_breath_level = breathLevelDb + breath_offset_db
+    effective_hnr = breathHnrDb
+    if effective_hnr is not None:
+        effective_hnr = float(effective_hnr)
+    if breath_hnr_offset_db != 0.0:
+        if effective_hnr is None:
+            effective_hnr = float(breath_hnr_offset_db)
+        else:
+            effective_hnr = float(effective_hnr) + float(breath_hnr_offset_db)
+
     y = _add_breath_noise(
         y,
         effective_breath_level,
         sr,
         f0_track=source.instantaneous_frequency,
-        hnr_target_db=breathHnrDb,
+        hnr_target_db=effective_hnr,
     )
     return _normalize_peak(y, PEAK_DEFAULT)
 
@@ -1166,12 +1303,20 @@ def synth_vowel(
     freq_multiplier: Optional[np.ndarray] = None
     amp_multiplier: Optional[np.ndarray] = None
     formant_offset_track: Optional[np.ndarray] = None
+    formant_absolute_track: Optional[np.ndarray] = None
     breath_offset_db = 0.0
+    breath_hnr_offset_db = 0.0
     if dynamicControls is not None:
         freq_multiplier = _match_control_track(dynamicControls.f0Multiplier, sample_count)
         amp_multiplier = _match_control_track(dynamicControls.amplitudeMultiplier, sample_count)
         formant_offset_track = _match_control_track(dynamicControls.formantOffsetHz, sample_count)
-        breath_offset_db = float(dynamicControls.breathLevelOffsetDb)
+        formant_absolute_track = _match_control_track(dynamicControls.formantTargetHz, sample_count)
+        breath_track = _match_control_track(dynamicControls.breathLevelOffsetDb, sample_count)
+        breath_hnr_track = _match_control_track(dynamicControls.breathHnrOffsetDb, sample_count)
+        if breath_track is not None and breath_track.size > 0:
+            breath_offset_db = float(np.mean(breath_track))
+        if breath_hnr_track is not None and breath_hnr_track.size > 0:
+            breath_hnr_offset_db = float(np.mean(breath_hnr_track))
         if freq_multiplier is not None:
             freq_multiplier = np.clip(freq_multiplier, _CONTROL_MIN_F0_MULT, _CONTROL_MAX_F0_MULT)
         if amp_multiplier is not None:
@@ -1277,6 +1422,19 @@ def synth_vowel(
             sustain_phase,
             external_offsets=formant_offset_track,
         )
+        if formant_absolute_track is not None and formant_absolute_track.size > 0:
+            if formant_absolute_track.ndim == 1:
+                formant_absolute_track = formant_absolute_track[:, None]
+            if formant_absolute_track.shape[1] < freq_targets.shape[1]:
+                pad_width = freq_targets.shape[1] - formant_absolute_track.shape[1]
+                formant_absolute_track = np.pad(
+                    formant_absolute_track,
+                    ((0, 0), (0, pad_width)),
+                    mode='edge',
+                )
+            elif formant_absolute_track.shape[1] > freq_targets.shape[1]:
+                formant_absolute_track = formant_absolute_track[:, : freq_targets.shape[1]]
+            freq_targets = formant_absolute_track
         y = _apply_formant_filters(src, freq_targets, bw_targets, sampleRate)
     else:
         neutral_profile: Optional[np.ndarray] = None
@@ -1305,12 +1463,21 @@ def synth_vowel(
             applyRadiation=True,
         )
     effective_breath_level = breathLevelDb + breath_offset_db
+    effective_hnr = breathHnrDb
+    if effective_hnr is not None:
+        effective_hnr = float(effective_hnr)
+    if breath_hnr_offset_db != 0.0:
+        if effective_hnr is None:
+            effective_hnr = float(breath_hnr_offset_db)
+        else:
+            effective_hnr = float(effective_hnr) + float(breath_hnr_offset_db)
+
     y = _add_breath_noise(
         y,
         effective_breath_level,
         sampleRate,
         f0_track=source.instantaneous_frequency,
-        hnr_target_db=breathHnrDb,
+        hnr_target_db=effective_hnr,
     )
     if nasal_leak_depth > EPS and nasal_zeros[0].size > 0:
         y = _apply_nasal_antiresonances(
@@ -2084,9 +2251,21 @@ def synth_token_sequence(
                 )
             adjusted_f0 = token_f0 * control_f0_scale
             token_vowel_kwargs = dict(vowel_kwargs)
-            if control.breathLevelOffsetDb != 0.0:
+            breath_offset_db = 0.0
+            if control.breathLevelOffsetDb is not None and control.breathLevelOffsetDb.size > 0:
+                breath_offset_db = float(np.mean(control.breathLevelOffsetDb))
+            if breath_offset_db != 0.0:
                 base_breath = token_vowel_kwargs.get('breathLevelDb', -40.0)
-                token_vowel_kwargs['breathLevelDb'] = float(base_breath) + control.breathLevelOffsetDb
+                token_vowel_kwargs['breathLevelDb'] = float(base_breath) + breath_offset_db
+            hnr_offset_db = 0.0
+            if control.breathHnrOffsetDb is not None and control.breathHnrOffsetDb.size > 0:
+                hnr_offset_db = float(np.mean(control.breathHnrOffsetDb))
+            if hnr_offset_db != 0.0:
+                base_hnr = token_vowel_kwargs.get('breathHnrDb', 20.0)
+                if base_hnr is None:
+                    token_vowel_kwargs['breathHnrDb'] = float(hnr_offset_db)
+                else:
+                    token_vowel_kwargs['breathHnrDb'] = float(base_hnr) + hnr_offset_db
             cv_kwargs: Dict[str, Any] = {
                 'f0': adjusted_f0,
                 'sampleRate': sampleRate,
