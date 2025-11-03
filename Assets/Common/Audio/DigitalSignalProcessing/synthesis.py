@@ -56,6 +56,8 @@ from .sources import (
     DEFAULT_AM_OU_TAU,
     DEFAULT_DRIFT_CENTS,
     DEFAULT_DRIFT_RETURN_RATE,
+    DEFAULT_PERIOD_JITTER_LIMIT,
+    DEFAULT_PERIOD_JITTER_STD,
     DEFAULT_SHIMMER_PERCENT,
     DEFAULT_TREMOLO_DEPTH_DB,
     DEFAULT_TREMOLO_FREQUENCY_HZ,
@@ -135,6 +137,10 @@ _FORMANT_MIN_FREQ_HZ = 40.0
 _FORMANT_MAX_FREQ_RATIO = 0.48
 _FORMANT_MIN_BW_HZ = 15.0
 _FORMANT_MAX_BW_RATIO = 0.45
+_FORMANT_FOLLOW_TAU_MS = 55.0
+_FORMANT_FOLLOW_FREQ_NOISE_STD = 8.0
+_FORMANT_FOLLOW_BW_NOISE_STD = 5.0
+_FORMANT_FOLLOW_NOISE_CLIP = 24.0
 
 
 def _resolve_formant_ou_phase(
@@ -193,6 +199,54 @@ def _smooth_tracks(tracks: np.ndarray, sr: int, smoothing_ms: float) -> np.ndarr
     return smoothed
 
 
+def _simulate_critical_follow(
+    targets: np.ndarray,
+    sr: int,
+    tau_ms: float,
+    noise_std: float,
+    noise_clip: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Simulate critically damped second-order pursuit of target trajectories."""
+
+    if targets.ndim != 2:
+        raise ValueError('targets must be a 2-D array')
+
+    sample_count, series_count = targets.shape
+    if sample_count == 0:
+        return np.zeros((0, series_count), dtype=np.float64)
+
+    if sr <= 0:
+        raise ValueError('Sample rate must be positive for critical follow simulation')
+
+    tau_s = max(float(tau_ms), 1e-3) / 1000.0
+    dt = 1.0 / float(sr)
+    omega = 1.0 / tau_s
+    omega_sq = omega * omega
+    sqrt_dt = float(np.sqrt(dt))
+    noise_std = max(float(noise_std), 0.0)
+    noise_clip = max(float(noise_clip), 0.0)
+
+    position = targets[0].astype(np.float64, copy=False)
+    velocity = np.zeros(series_count, dtype=np.float64)
+    output = np.empty_like(targets, dtype=np.float64)
+    output[0] = position
+
+    for idx in range(1, sample_count):
+        target = targets[idx].astype(np.float64, copy=False)
+        accel = omega_sq * (target - position) - 2.0 * omega * velocity
+        if noise_std > 0.0:
+            noise = rng.normal(0.0, noise_std, size=series_count)
+            if noise_clip > 0.0:
+                noise = np.clip(noise, -noise_clip, noise_clip)
+            accel += noise * sqrt_dt
+        velocity += accel * dt
+        position = position + velocity * dt
+        output[idx] = position
+
+    return output
+
+
 def _generate_ou_offsets(
     num_samples: int,
     series_count: int,
@@ -244,19 +298,51 @@ def _make_formant_tracks(
     if formants.size != bws.size:
         raise ValueError('Formant and bandwidth arrays must share length')
 
-    if not _formant_ou_enabled(params):
-        return formants, bws
-
     total_samples = max(int(sample_count), 0)
     if total_samples <= 0 or sr <= 0:
         return formants, bws
 
     generator = rng if rng is not None else np.random.default_rng()
-    freq_offsets = _generate_ou_offsets(total_samples, formants.size, sr, params.frequency, generator)
-    bw_offsets = _generate_ou_offsets(total_samples, bws.size, sr, params.bandwidth, generator)
+    freq_targets = np.repeat(formants[None, :], total_samples, axis=0)
+    bw_targets = np.repeat(bws[None, :], total_samples, axis=0)
 
-    freq_tracks = formants[None, :] + freq_offsets
-    bw_tracks = bws[None, :] + bw_offsets
+    if _formant_ou_enabled(params):
+        freq_offsets = _generate_ou_offsets(
+            total_samples,
+            formants.size,
+            sr,
+            params.frequency,
+            generator,
+        )
+        bw_offsets = _generate_ou_offsets(
+            total_samples,
+            bws.size,
+            sr,
+            params.bandwidth,
+            generator,
+        )
+        freq_targets = freq_targets + freq_offsets
+        bw_targets = bw_targets + bw_offsets
+
+    freq_tracks = _simulate_critical_follow(
+        freq_targets,
+        sr,
+        _FORMANT_FOLLOW_TAU_MS,
+        _FORMANT_FOLLOW_FREQ_NOISE_STD,
+        _FORMANT_FOLLOW_NOISE_CLIP,
+        generator,
+    )
+    seed = generator.integers(0, 2**32)
+    bw_rng = np.random.default_rng(seed)
+    bw_tracks = _simulate_critical_follow(
+        bw_targets,
+        sr,
+        _FORMANT_FOLLOW_TAU_MS,
+        _FORMANT_FOLLOW_BW_NOISE_STD,
+        _FORMANT_FOLLOW_NOISE_CLIP,
+        bw_rng,
+    )
+
     max_freq = sr * _FORMANT_MAX_FREQ_RATIO
     max_bw = sr * _FORMANT_MAX_BW_RATIO
     freq_tracks = np.clip(freq_tracks, _FORMANT_MIN_FREQ_HZ, max_freq)
@@ -420,6 +506,8 @@ def _synth_vowel_fixed(
     vibratoFrequencyHz: float = DEFAULT_VIBRATO_FREQUENCY_HZ,
     tremorDepthCents: float = DEFAULT_TREMOR_DEPTH_CENTS,
     tremorFrequencyHz: float = DEFAULT_TREMOR_FREQUENCY_HZ,
+    periodJitterStd: float = DEFAULT_PERIOD_JITTER_STD,
+    periodJitterLimit: float = DEFAULT_PERIOD_JITTER_LIMIT,
     areaProfile: Optional[Sequence[float]] = None,
     articulation: Optional[Dict[str, float]] = None,
     kellySections: Optional[int] = None,
@@ -452,6 +540,8 @@ def _synth_vowel_fixed(
         vibratoFrequencyHz: Vibrato speed in Hz.
         tremorDepthCents: Tremor depth in cents.
         tremorFrequencyHz: Tremor speed in Hz.
+        periodJitterStd: Standard deviation for per-cycle frequency scaling.
+        periodJitterLimit: Hard limit applied to the per-cycle scaling.
         areaProfile: Optional custom area function for Kelly-Lochbaum.
         articulation: Optional articulation overrides for waveguide.
         kellySections: Number of waveguide sections to use.
@@ -479,6 +569,8 @@ def _synth_vowel_fixed(
         amplitude_ou_sigma=amplitudeOuSigma,
         amplitude_ou_tau=amplitudeOuTau,
         amplitude_ou_clip_multiple=amplitudeOuClipMultiple,
+        period_jitter_std=periodJitterStd,
+        period_jitter_limit=periodJitterLimit,
     )
     src = source.signal
     formants = np.asarray(formants, dtype=np.float64)
@@ -539,6 +631,8 @@ def synth_vowel(
     vibratoFrequencyHz: float = DEFAULT_VIBRATO_FREQUENCY_HZ,
     tremorDepthCents: float = DEFAULT_TREMOR_DEPTH_CENTS,
     tremorFrequencyHz: float = DEFAULT_TREMOR_FREQUENCY_HZ,
+    periodJitterStd: float = DEFAULT_PERIOD_JITTER_STD,
+    periodJitterLimit: float = DEFAULT_PERIOD_JITTER_LIMIT,
     kellyBlend: Optional[float] = None,
     articulation: Optional[Dict[str, float]] = None,
     areaProfile: Optional[Sequence[float]] = None,
@@ -571,6 +665,8 @@ def synth_vowel(
         vibratoFrequencyHz: Vibrato frequency in Hz.
         tremorDepthCents: Tremor depth in cents.
         tremorFrequencyHz: Tremor frequency in Hz.
+        periodJitterStd: Standard deviation of per-cycle jitter multiplier.
+        periodJitterLimit: Absolute limit applied to the jitter multiplier.
         kellyBlend: Blend factor between formant filter and waveguide.
         articulation: Optional articulation overrides for waveguide.
         areaProfile: Custom vocal tract area function.
@@ -599,6 +695,8 @@ def synth_vowel(
         amplitude_ou_sigma=amplitudeOuSigma,
         amplitude_ou_tau=amplitudeOuTau,
         amplitude_ou_clip_multiple=amplitudeOuClipMultiple,
+        period_jitter_std=periodJitterStd,
+        period_jitter_limit=periodJitterLimit,
     )
     src = source.signal
     spec = VOWEL_TABLE[vowel]
@@ -916,6 +1014,8 @@ def synth_vowel_with_onset(
     vowel_kwargs.setdefault('vibratoFrequencyHz', DEFAULT_VIBRATO_FREQUENCY_HZ)
     vowel_kwargs.setdefault('tremorDepthCents', DEFAULT_TREMOR_DEPTH_CENTS)
     vowel_kwargs.setdefault('tremorFrequencyHz', DEFAULT_TREMOR_FREQUENCY_HZ)
+    vowel_kwargs.setdefault('periodJitterStd', DEFAULT_PERIOD_JITTER_STD)
+    vowel_kwargs.setdefault('periodJitterLimit', DEFAULT_PERIOD_JITTER_LIMIT)
     speaker_profile: Optional[SpeakerProfile] = vowel_kwargs.get('speakerProfile')
     onset_phase = _resolve_formant_ou_phase(speaker_profile, vowel, 'onset')
     sustain_phase = _resolve_formant_ou_phase(speaker_profile, vowel, 'sustain')
@@ -943,6 +1043,8 @@ def synth_vowel_with_onset(
         'vibratoFrequencyHz': vowel_kwargs['vibratoFrequencyHz'],
         'tremorDepthCents': vowel_kwargs['tremorDepthCents'],
         'tremorFrequencyHz': vowel_kwargs['tremorFrequencyHz'],
+        'periodJitterStd': vowel_kwargs['periodJitterStd'],
+        'periodJitterLimit': vowel_kwargs['periodJitterLimit'],
     }
 
     if not onsetFormants:

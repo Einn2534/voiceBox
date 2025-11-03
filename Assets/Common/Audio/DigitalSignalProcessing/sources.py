@@ -10,7 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from .constants import DTYPE
+from .constants import DTYPE, EPS
 from .core import _db_to_lin
 from .filters import _bandpass_biquad_coeff, _biquad_process, _lip_radiation
 
@@ -34,6 +34,9 @@ _MAX_SHIMMER_FACTOR = 4.0
 _MIN_AMPLITUDE_ENVELOPE = 0.05
 _MAX_AMPLITUDE_ENVELOPE = 8.0
 _GLOTTAL_LP_CUTOFF_HZ = 800.0
+DEFAULT_PERIOD_JITTER_STD = 0.006
+DEFAULT_PERIOD_JITTER_LIMIT = 0.035
+_MIN_PERIOD_SCALE = 0.6
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,22 @@ def _sample_shimmer_track(
     return factors[cycle_ids]
 
 
+def _sample_period_scale(
+    rng: np.random.Generator,
+    std: float,
+    limit: float,
+) -> float:
+    """Return a per-period multiplicative factor for pitch jitter."""
+
+    if std <= 0.0:
+        return 1.0
+
+    scale = 1.0 + rng.normal(0.0, std)
+    if limit > 0.0:
+        scale = float(np.clip(scale, 1.0 - limit, 1.0 + limit))
+    return float(max(scale, _MIN_PERIOD_SCALE))
+
+
 def _glottal_source(
     f0: float,
     dur_s: float,
@@ -117,6 +136,8 @@ def _glottal_source(
     amplitude_ou_sigma: float = DEFAULT_AM_OU_SIGMA,
     amplitude_ou_tau: float = DEFAULT_AM_OU_TAU,
     amplitude_ou_clip_multiple: float = DEFAULT_AM_OU_CLIP_MULTIPLE,
+    period_jitter_std: float = DEFAULT_PERIOD_JITTER_STD,
+    period_jitter_limit: float = DEFAULT_PERIOD_JITTER_LIMIT,
 ) -> GlottalSourceResult:
     """Saw-like glottal source enriched with humanising modulations."""
 
@@ -171,13 +192,35 @@ def _glottal_source(
         + vibrato_semitones
         + tremor_semitones
     )
-    inst_f = f0 * (2.0 ** (composite_semitones / 12.0))
+    base_inst_f = f0 * (2.0 ** (composite_semitones / 12.0))
 
-    phase = np.cumsum(2.0 * pi * inst_f / sr, dtype=np.float64)
-    saw = (2.0 * ((phase / (2.0 * pi)) % 1.0) - 1.0).astype(np.float64)
+    cycle_phase = float(rng.uniform(0.0, 2.0 * pi))
+    cycle_index = 0
+    current_scale = _sample_period_scale(rng, float(period_jitter_std), float(period_jitter_limit))
+    cycle_positions = np.empty(n, dtype=np.float64)
+    phase_track = np.empty(n, dtype=np.float64)
+    freq_track = np.empty(n, dtype=np.float64)
+    for idx, base_freq in enumerate(base_inst_f):
+        scale = current_scale
+        freq = max(base_freq * scale, EPS)
+        freq_track[idx] = freq
+        delta = 2.0 * pi * freq / sr
+        cycle_phase += delta
+        while cycle_phase >= 2.0 * pi:
+            cycle_phase -= 2.0 * pi
+            cycle_index += 1
+            current_scale = _sample_period_scale(
+                rng,
+                float(period_jitter_std),
+                float(period_jitter_limit),
+            )
+        cycle_positions[idx] = cycle_phase / (2.0 * pi)
+        phase_track[idx] = 2.0 * pi * (cycle_index + cycle_positions[idx])
+
+    saw = (2.0 * cycle_positions - 1.0).astype(np.float64)
 
     shimmer_std = shimmer_percent if shimmer_percent is not None else max(_db_to_lin(shimmer_db) - 1.0, 0.0)
-    shimmer_track = _sample_shimmer_track(phase, float(shimmer_std), rng)
+    shimmer_track = _sample_shimmer_track(phase_track, float(shimmer_std), rng)
 
     dt = 1.0 / float(sr)
     amp_ou = _generate_ou_series(
@@ -210,8 +253,10 @@ def _glottal_source(
 
     signal = y.astype(DTYPE, copy=False)
     amp_env = amplitude_envelope.astype(DTYPE, copy=False)
-    freq_track = inst_f.astype(np.float64, copy=False)
-    cents_track = (composite_semitones * 100.0).astype(np.float64, copy=False)
+    freq_track = freq_track.astype(np.float64, copy=False)
+    with np.errstate(divide='ignore'):
+        cents_track = 1200.0 * np.log2(np.maximum(freq_track, EPS) / max(f0, EPS))
+    cents_track = np.nan_to_num(cents_track, nan=0.0, posinf=0.0, neginf=0.0)
     return GlottalSourceResult(signal, freq_track, amp_env, cents_track)
 
 
