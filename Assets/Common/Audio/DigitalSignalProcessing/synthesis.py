@@ -50,6 +50,7 @@ from .filters import (
     _pre_emphasis,
 )
 from .io import write_wav
+from .HumanizationProgram import HumanizationProgram, build_humanization_program
 from .sources import (
     DEFAULT_AM_OU_CLIP_MULTIPLE,
     DEFAULT_AM_OU_SIGMA,
@@ -120,6 +121,7 @@ _CONSONANT_BASE_DURATION_MS: Dict[str, float] = {
 __all__ = [
     "TokenProsody",
     "synth_vowel",
+    "synth_vowel_with_program",
     "synth_fricative",
     "synth_plosive",
     "synth_affricate",
@@ -607,6 +609,46 @@ def _synth_vowel_fixed(
         hnr_target_db=breathHnrDb,
     )
     return _normalize_peak(y, PEAK_DEFAULT)
+
+
+def synth_vowel_with_program(
+    vowel: str = 'a',
+    f0: float = 120.0,
+    durationSeconds: float = 1.0,
+    sampleRate: int = 22050,
+    *,
+    program: Optional[HumanizationProgram] = None,
+    programStyle: str = 'speech',
+    baseSpeakerProfile: Optional[SpeakerProfile] = None,
+    **overrides: Any,
+) -> np.ndarray:
+    """Synthesize a vowel using a named humanisation program.
+
+    Args:
+        vowel: Target vowel symbol.
+        f0: Fundamental frequency in Hz.
+        durationSeconds: Output duration in seconds.
+        sampleRate: Rendering sample rate in Hz.
+        program: Explicit humanisation program to apply.
+        programStyle: Preset identifier if ``program`` is not supplied.
+        baseSpeakerProfile: Optional speaker profile template for nasal traits.
+        overrides: Additional keyword arguments forwarded to :func:`synth_vowel`.
+    """
+
+    active_program = program if program is not None else build_humanization_program(programStyle)
+    synth_kwargs: Dict[str, Any] = dict(active_program.synth_kwargs())
+    if 'speakerProfile' in overrides:
+        raise ValueError('speakerProfile override is not supported; use baseSpeakerProfile instead.')
+    synth_kwargs.update(overrides)
+    speaker_profile = active_program.create_speaker_profile(baseSpeakerProfile)
+    return synth_vowel(
+        vowel=vowel,
+        f0=f0,
+        durationSeconds=durationSeconds,
+        sampleRate=sampleRate,
+        speakerProfile=speaker_profile,
+        **synth_kwargs,
+    )
 
 
 def synth_vowel(
