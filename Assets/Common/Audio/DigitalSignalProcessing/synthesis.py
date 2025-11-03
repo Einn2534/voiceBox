@@ -452,6 +452,7 @@ class _LowRateControlGenerator:
         self.f0State = 0.0
         self.ampState = 0.0
         self.breathState = 0.0
+        self.hnrState = 0.0
         self.formantState = np.zeros(_CONTROL_FORMANT_COUNT, dtype=np.float64)
 
     def _ou_series(
