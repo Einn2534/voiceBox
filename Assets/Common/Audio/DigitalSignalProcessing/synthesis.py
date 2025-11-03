@@ -123,6 +123,8 @@ _CONSONANT_BASE_DURATION_MS: Dict[str, float] = {
 
 __all__ = [
     "DynamicControl",
+    "FrameControlFrame",
+    "SegmentControlPlan",
     "LowRateControlTargets",
     "TokenProsody",
     "synth_vowel",
@@ -147,6 +149,27 @@ class DynamicControl:
     amplitudeMultiplier: Optional[np.ndarray] = None
     formantOffsetHz: Optional[np.ndarray] = None
     breathLevelOffsetDb: float = 0.0
+
+
+@dataclass(frozen=True)
+class FrameControlFrame:
+    """Frame-level control snapshot combining targets and stochastic drift."""
+
+    startSample: int
+    endSample: int
+    f0Multiplier: float
+    amplitudeMultiplier: float
+    formantOffsetHz: np.ndarray
+    breathLevelOffsetDb: float
+
+
+@dataclass(frozen=True)
+class SegmentControlPlan:
+    """Frame-wise plan paired with the per-sample dynamic control tracks."""
+
+    totalSamples: int
+    dynamicControl: DynamicControl
+    frames: Tuple[FrameControlFrame, ...]
 
 
 @dataclass(frozen=True)
@@ -180,6 +203,20 @@ _CONTROL_MIN_F0_MULT = 0.6
 _CONTROL_MAX_F0_MULT = 1.6
 _FINAL_PEAK_TARGET = 10.0 ** (-1.0 / 20.0)
 _SOFT_LIMIT_DRIVE_DB = 1.5
+_BASE_F0_MULTIPLIER = 1.0
+_BASE_AMPLITUDE_MULTIPLIER = 1.0
+_BASE_FORMANT_OFFSET_HZ = 0.0
+
+
+def _frame_length_samples(sample_rate: int, frame_rate: float) -> int:
+    """Return the integer frame length in samples for the low-rate controller."""
+
+    if sample_rate <= 0:
+        return 0
+    if frame_rate <= 0.0:
+        return sample_rate
+    length = int(round(sample_rate / float(frame_rate)))
+    return max(1, length)
 
 
 def _match_control_track(track: Optional[np.ndarray], target_len: int) -> Optional[np.ndarray]:
@@ -211,6 +248,72 @@ def _match_control_track(track: Optional[np.ndarray], target_len: int) -> Option
         stacked = np.stack(cols, axis=1)
         return stacked.astype(np.float64, copy=False)
     raise ValueError("Control track must be one- or two-dimensional")
+
+
+def _build_frame_control_plan(
+    sample_count: int,
+    sample_rate: int,
+    control: DynamicControl,
+    frame_rate: float,
+    formant_count: int,
+) -> Tuple[FrameControlFrame, ...]:
+    """Aggregate per-sample controls into ~5 ms frame snapshots."""
+
+    if sample_count <= 0 or sample_rate <= 0:
+        return tuple()
+
+    frame_length = _frame_length_samples(sample_rate, frame_rate)
+    if frame_length <= 0:
+        return tuple()
+
+    f0_track = _match_control_track(control.f0Multiplier, sample_count)
+    if f0_track is None:
+        f0_track = np.full(sample_count, _BASE_F0_MULTIPLIER, dtype=np.float64)
+
+    amp_track = _match_control_track(control.amplitudeMultiplier, sample_count)
+    if amp_track is None:
+        amp_track = np.full(sample_count, _BASE_AMPLITUDE_MULTIPLIER, dtype=np.float64)
+
+    formant_track = _match_control_track(control.formantOffsetHz, sample_count)
+    if formant_track is None:
+        formant_track = np.full(
+            (sample_count, max(formant_count, 1)),
+            _BASE_FORMANT_OFFSET_HZ,
+            dtype=np.float64,
+        )
+    elif formant_track.ndim == 1:
+        formant_track = formant_track[:, None]
+
+    active_formants = max(0, min(int(formant_count), formant_track.shape[1]))
+    if active_formants == 0:
+        formant_track = np.zeros((sample_count, 0), dtype=np.float64)
+    else:
+        formant_track = formant_track[:, :active_formants]
+
+    frames: List[FrameControlFrame] = []
+    for start in range(0, sample_count, frame_length):
+        end = min(start + frame_length, sample_count)
+        if end <= start:
+            continue
+        frame_slice = slice(start, end)
+        frame_f0 = float(np.mean(f0_track[frame_slice]))
+        frame_amp = float(np.mean(amp_track[frame_slice]))
+        if formant_track.size > 0:
+            frame_formant = np.mean(formant_track[frame_slice, :], axis=0)
+        else:
+            frame_formant = np.zeros((0,), dtype=np.float64)
+        frames.append(
+            FrameControlFrame(
+                startSample=int(start),
+                endSample=int(end),
+                f0Multiplier=frame_f0,
+                amplitudeMultiplier=frame_amp,
+                formantOffsetHz=frame_formant.astype(np.float64, copy=False),
+                breathLevelOffsetDb=float(control.breathLevelOffsetDb),
+            )
+        )
+
+    return tuple(frames)
 
 
 def _smooth_control_track(track: np.ndarray, sample_rate: int, smoothing_ms: float) -> np.ndarray:
@@ -518,6 +621,35 @@ class _LowRateControlGenerator:
             formantOffsetHz=formant_interp.astype(np.float64, copy=False),
             breathLevelOffsetDb=breath_offset_db,
         )
+
+
+def _render_segment_control_plan(
+    sample_count: int,
+    sample_rate: int,
+    formant_count: int,
+    generator: _LowRateControlGenerator,
+    targets: Optional[LowRateControlTargets],
+) -> SegmentControlPlan:
+    """Produce per-sample control and frame plan for a synthesis segment."""
+
+    control = generator.next(
+        sample_count,
+        sample_rate,
+        formant_count,
+        targets=targets,
+    )
+    frames = _build_frame_control_plan(
+        sample_count,
+        sample_rate,
+        control,
+        generator.frameRate,
+        formant_count,
+    )
+    return SegmentControlPlan(
+        totalSamples=int(sample_count),
+        dynamicControl=control,
+        frames=frames,
+    )
 
 _FORMANT_MIN_FREQ_HZ = 40.0
 _FORMANT_MAX_FREQ_RATIO = 0.48
@@ -1794,7 +1926,8 @@ def synth_token_sequence(
     tokenProsody: Optional[Sequence[Optional[TokenProsody]]] = None,
     tokenControlTargets: Optional[Sequence[Optional[LowRateControlTargets]]] = None,
     phraseDurationScaleBounds: Optional[Sequence[Tuple[float, float]]] = None,
-) -> np.ndarray:
+    returnControlPlan: bool = False,
+) -> np.ndarray | Tuple[np.ndarray, Tuple[SegmentControlPlan, ...]]:
     """Synthesize a token sequence with optional per-token prosody overrides.
 
     Args:
@@ -1810,9 +1943,12 @@ def synth_token_sequence(
         tokenProsody: Optional overrides for pitch and timing per token index.
         tokenControlTargets: Optional low-rate control targets per token.
         phraseDurationScaleBounds: Optional per-phrase (start, end) duration scales.
+        returnControlPlan: When True, return the synthesized audio along with the
+            frame-level control plan for each segment.
     """
 
     segs: List[np.ndarray] = []
+    segmentPlans: List[SegmentControlPlan] = []
     default_gap_ms = max(0.0, float(gapMilliseconds))
     default_vowel_ms = max(_MIN_VOWEL_DURATION_MS, float(vowelMilliseconds))
 
@@ -1859,15 +1995,19 @@ def synth_token_sequence(
                     pause_ms = max(0.0, float(prosody.gapMilliseconds))
             pause_ms *= phrase_scale
             pause_samples = max(1, _ms_to_samples(int(round(pause_ms)), sampleRate))
-            control = control_generator.next(
+            pause_plan = _render_segment_control_plan(
                 pause_samples,
                 sampleRate,
                 _CONTROL_FORMANT_COUNT,
-                targets=control_targets,
+                control_generator,
+                control_targets,
             )
+            control = pause_plan.dynamicControl
             pause_seg = _synth_pause_with_inhale(pause_ms, sampleRate, rng)
             pause_seg = _apply_amplitude_control(pause_seg, control)
             segs.append(pause_seg)
+            if returnControlPlan:
+                segmentPlans.append(pause_plan)
             ou_state = 0.0
             continue
 
@@ -1922,15 +2062,26 @@ def synth_token_sequence(
             if pre_ms is not None:
                 expected_ms += float(pre_ms)
             expected_samples = max(1, _ms_to_samples(int(round(expected_ms)), sampleRate))
-            control = control_generator.next(
+            segment_plan = _render_segment_control_plan(
                 expected_samples,
                 sampleRate,
                 _CONTROL_FORMANT_COUNT,
-                targets=control_targets,
+                control_generator,
+                control_targets,
             )
-            control_f0_scale = 1.0
-            if control.f0Multiplier is not None and control.f0Multiplier.size > 0:
-                control_f0_scale = float(np.clip(np.mean(control.f0Multiplier), _CONTROL_MIN_F0_MULT, _CONTROL_MAX_F0_MULT))
+            control = segment_plan.dynamicControl
+            if returnControlPlan:
+                segmentPlans.append(segment_plan)
+            control_f0_scale = _BASE_F0_MULTIPLIER
+            if segment_plan.frames:
+                frame_f0_values = [frame.f0Multiplier for frame in segment_plan.frames]
+                control_f0_scale = float(
+                    np.clip(
+                        np.mean(frame_f0_values),
+                        _CONTROL_MIN_F0_MULT,
+                        _CONTROL_MAX_F0_MULT,
+                    )
+                )
             adjusted_f0 = token_f0 * control_f0_scale
             token_vowel_kwargs = dict(vowel_kwargs)
             if control.breathLevelOffsetDb != 0.0:
@@ -1953,12 +2104,16 @@ def synth_token_sequence(
             seg = _apply_amplitude_control(seg, control)
 
         elif t in VOWEL_TABLE:
-            control = control_generator.next(
+            segment_plan = _render_segment_control_plan(
                 expected_samples,
                 sampleRate,
                 _CONTROL_FORMANT_COUNT,
-                targets=control_targets,
+                control_generator,
+                control_targets,
             )
+            control = segment_plan.dynamicControl
+            if returnControlPlan:
+                segmentPlans.append(segment_plan)
             token_vowel_kwargs = dict(vowel_kwargs)
             seg = synth_vowel(
                 t,
@@ -1977,12 +2132,16 @@ def synth_token_sequence(
             if consonant_ms is not None:
                 nasal_ms = max(_MIN_NASAL_DURATION_MS, int(round(consonant_ms)))
             expected_samples = max(1, _ms_to_samples(nasal_ms, sampleRate))
-            control = control_generator.next(
+            segment_plan = _render_segment_control_plan(
                 expected_samples,
                 sampleRate,
                 _CONTROL_FORMANT_COUNT,
-                targets=control_targets,
+                control_generator,
+                control_targets,
             )
+            control = segment_plan.dynamicControl
+            if returnControlPlan:
+                segmentPlans.append(segment_plan)
             seg = synth_nasal(
                 NASAL_TOKEN_MAP[t],
                 f0=token_f0,
@@ -2001,11 +2160,17 @@ def synth_token_sequence(
         segs.append(seg.astype(DTYPE, copy=False))
 
     if not segs:
-        return np.zeros(_ms_to_samples(int(_MIN_PAUSE_DURATION_MS), sampleRate), dtype=DTYPE)
+        empty = np.zeros(_ms_to_samples(int(_MIN_PAUSE_DURATION_MS), sampleRate), dtype=DTYPE)
+        if returnControlPlan:
+            return empty, tuple()
+        return empty
 
     y = np.concatenate(segs).astype(DTYPE, copy=False)
     y = _soft_limit(y, _SOFT_LIMIT_DRIVE_DB)
-    return _normalize_peak(y, _FINAL_PEAK_TARGET)
+    normalized = _normalize_peak(y, _FINAL_PEAK_TARGET)
+    if returnControlPlan:
+        return normalized, tuple(segmentPlans)
+    return normalized
 
 
 def synth_tokens_to_wav(
