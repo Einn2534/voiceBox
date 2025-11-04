@@ -33,6 +33,7 @@ DEFAULT_VIBRATO_DEPTH_CENTS = 0.0
 DEFAULT_VIBRATO_FREQUENCY_HZ = 5.5
 DEFAULT_TREMOR_DEPTH_CENTS = 0.0
 DEFAULT_TREMOR_FREQUENCY_HZ = 8.5
+TOKEN_ENVELOPE_MILLISECONDS = 12
 
 
 # =======================
@@ -1298,6 +1299,38 @@ def synth_phrase_to_wav(
     return write_wav(outPath, y, sampleRate=sampleRate)
 
 
+def _apply_token_envelope(
+    segment: np.ndarray,
+    sampleRate: int,
+    fadeMilliseconds: int,
+) -> np.ndarray:
+    """Apply a short fade in/out to a segment to avoid abrupt level jumps.
+
+    Args:
+        segment (np.ndarray): Waveform segment to apply the envelope to.
+        sampleRate (int): Sampling rate used to convert milliseconds.
+        fadeMilliseconds (int): Duration of the fade sections in milliseconds.
+
+    Returns:
+        np.ndarray: Segment with the smoothing envelope applied.
+    """
+
+    if fadeMilliseconds <= 0:
+        return segment.astype(DTYPE, copy=False)
+
+    fade_samples = _ms_to_samples(float(fadeMilliseconds), sampleRate)
+    fade_samples = min(int(fade_samples), len(segment) // 2)
+    if fade_samples <= 0:
+        return segment.astype(DTYPE, copy=False)
+
+    processed = segment.astype(DTYPE, copy=True)
+    fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=DTYPE)
+    fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=DTYPE)
+    processed[:fade_samples] *= fade_in
+    processed[-fade_samples:] *= fade_out
+    return processed
+
+
 def synth_token_sequence(
     tokens: Sequence[str],
     *,
@@ -1335,6 +1368,7 @@ def synth_token_sequence(
         else:
             raise ValueError(f"Unsupported token '{tok}' for synthesis")
 
+        seg = _apply_token_envelope(seg, sampleRate, TOKEN_ENVELOPE_MILLISECONDS)
         if segs and gap > 0:
             segs.append(np.zeros(gap, dtype=DTYPE))
         segs.append(seg.astype(DTYPE, copy=False))
