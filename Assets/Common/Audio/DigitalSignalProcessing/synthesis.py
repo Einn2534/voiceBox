@@ -196,9 +196,10 @@ _CONTROL_FORMANT_COUNT = 3
 _CONTROL_F0_SIGMA_CENTS = 6.0
 _CONTROL_F0_TAU_MS = 220.0
 _CONTROL_F0_CLIP_MULTIPLE = 3.0
-_CONTROL_AMP_SIGMA_DB = 1.5
-_CONTROL_AMP_TAU_MS = 260.0
-_CONTROL_AMP_CLIP_MULTIPLE = 3.0
+_CONTROL_AMP_SIGMA_DB = 0.7
+_CONTROL_AMP_TAU_MS = 340.0
+_CONTROL_AMP_CLIP_MULTIPLE = 2.0
+_CONTROL_AMP_EXTRA_SMOOTHING_MS = 90.0
 _CONTROL_FORMANT_SIGMA_HZ = 40.0
 _CONTROL_FORMANT_TAU_MS = 200.0
 _CONTROL_FORMANT_CLIP_MULTIPLE = 3.0
@@ -631,7 +632,11 @@ class _LowRateControlGenerator:
             frame_amp_track = frame_amp_track + target_amp_track
 
         amp_track = np.interp(sample_positions, frame_positions, frame_amp_track)
-        amp_track = _smooth_control_track(amp_track, sampleRate, self.smoothingMs)
+        amp_track = _smooth_control_track(
+            amp_track,
+            sampleRate,
+            self.smoothingMs + _CONTROL_AMP_EXTRA_SMOOTHING_MS,
+        )
         amp_multiplier = np.clip(
             10.0 ** (amp_track / 20.0),
             _CONTROL_MIN_AMP,
