@@ -368,7 +368,7 @@ class VoiceTestScreen(Screen):
             self._schedule_label_update("Disconnect")
 
     def send_text(self) -> None:
-        """Send the text from the UI input to Gemini."""
+        """Send the text from the UI input to Gemini and queue speech."""
         if not self.session or not self.loop or not self.loop.is_running():
             logger.warning("Cannot send text: session or loop is not ready.")
             return
@@ -378,6 +378,7 @@ class VoiceTestScreen(Screen):
             logger.debug("Empty input ignored")
             return
 
+        self.speech_synthesizer.enqueue(user_input)
         asyncio.run_coroutine_threadsafe(self._async_send_text(user_input), self.loop)
 
     async def _async_send_text(self, text: str) -> None:
