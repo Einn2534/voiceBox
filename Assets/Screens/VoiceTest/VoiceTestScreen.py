@@ -37,7 +37,7 @@ LabelBase.register(
 Builder.load_file("Assets/Screens/VoiceTest/VoiceTestScreen.kv")
 
 PHRASE_INTERVAL_SECONDS = 0.12
-MAX_PHRASE_LENGTH = 60
+MAX_PHRASE_LENGTH = 180
 
 
 @dataclass(frozen=True)
