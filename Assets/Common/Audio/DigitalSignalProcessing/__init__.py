@@ -1,6 +1,22 @@
+# Created on 2024-05-09
+# Author: ChatGPT
+# Description: Package exports for digital signal processing helpers.
 """Modularised digital signal processing helpers for the voiceBox project."""
 from __future__ import annotations
 
+from .pitch import (
+    PitchAnchor,
+    PhraseShape,
+    PitchEvent,
+    VibratoSpec,
+    PitchDriftSpec,
+    PitchCurve,
+    hz_to_lf0,
+    lf0_to_hz,
+    lf0_to_hz_array,
+    generate_pitch_curve,
+    generate_f0_targets,
+)
 from .constants import (
     DTYPE,
     EPS,
@@ -29,6 +45,17 @@ from .text import normalize_token_sequence, text_to_tokens
 from .io import write_wav
 
 __all__ = [
+    "PitchAnchor",
+    "PhraseShape",
+    "PitchEvent",
+    "VibratoSpec",
+    "PitchDriftSpec",
+    "PitchCurve",
+    "hz_to_lf0",
+    "lf0_to_hz",
+    "lf0_to_hz_array",
+    "generate_pitch_curve",
+    "generate_f0_targets",
     "DTYPE",
     "EPS",
     "PEAK_DEFAULT",
