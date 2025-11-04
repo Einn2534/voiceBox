@@ -6,6 +6,7 @@
 - [PyAudio](https://people.csail.mit.edu/hubert/pyaudio/#downloads) が依存する PortAudio 等のシステムパッケージ
 - 有効な Gemini Live API キーを保持した環境変数 `GEMINI_API_KEY`
 
+
 ## セットアップ
 1. プロジェクトルートで仮想環境を作成します。
    ```bash
